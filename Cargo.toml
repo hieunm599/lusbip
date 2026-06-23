@@ -3,6 +3,11 @@ name = "lusbip"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
+description = "CLI chia sẻ và kết nối thiết bị USB qua IP trên Linux"
+repository = "https://github.com/hieunm599/lusbip"
+readme = "README.md"
+keywords = ["usbip", "usb", "cli", "linux", "tui"]
+categories = ["command-line-utilities", "hardware-support", "network-programming"]
 
 [lib]
 name = "lusbip"
@@ -13,15 +18,15 @@ name = "lusbip"
 path = "src/main.rs"
 
 [dependencies]
-clap = { version = "4.5", features = ["derive"] }
-crossterm = "0.27"
-env_logger = "0.11"
-log = "0.4"
-nusb = { version = "0.2", features = ["tokio"] }
-num-derive = "0.4"
-num-traits = "0.2"
-thiserror = "2"
-tokio = { version = "1", features = ["full"] }
+clap = { version = "4.6.1", features = ["derive"] }
+crossterm = "0.29.0"
+env_logger = "0.11.10"
+log = "0.4.33"
+nusb = { version = "0.2.4", features = ["tokio"] }
+num-derive = "0.4.2"
+num-traits = "0.2.19"
+thiserror = "2.0.18"
+tokio = { version = "1.52.3", features = ["full"] }
 
 [features]
 default = []
