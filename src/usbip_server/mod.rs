@@ -276,6 +276,8 @@ impl UsbIpServer {
 
             available_devices.retain(|device| current_bus_ids.contains(&device.bus_id));
             used_devices.retain(|device| current_bus_ids.contains(&device.bus_id));
+            dedup_devices_by_bus_id(&mut available_devices);
+            dedup_devices_by_bus_id(&mut used_devices);
 
             available_devices
                 .iter()
@@ -384,7 +386,7 @@ impl UsbIpServer {
 
     pub async fn handle_op_req_devlist(&self) -> Result<UsbIpResponse> {
         trace!("Got OP_REQ_DEVLIST");
-        let devices = self.available_devices.read().await;
+        let devices = unique_devices_by_bus_id(self.available_devices.read().await.clone());
 
         // OP_REP_DEVLIST
         let usbip_resp = UsbIpResponse::op_rep_devlist(&devices);
@@ -412,8 +414,10 @@ impl UsbIpServer {
                 occupied.string_product =
                     occupied.new_string(&format!("{product} [occupied by {}]", peer.ip()));
             }
+            devices.retain(|device| device.bus_id != occupied.bus_id);
             devices.push(occupied);
         }
+        let devices = unique_devices_by_bus_id(devices);
 
         let usbip_resp = UsbIpResponse::op_rep_devlist(&devices);
         trace!("Sent OP_REP_DEVLIST");
@@ -570,6 +574,19 @@ fn is_usb_hub_info(device_info: &DeviceInfo) -> bool {
         || device_info
             .interfaces()
             .any(|interface| interface.class() == 0x09)
+}
+
+fn unique_devices_by_bus_id(devices: Vec<UsbDevice>) -> Vec<UsbDevice> {
+    let mut seen = HashSet::<String>::new();
+    devices
+        .into_iter()
+        .filter(|device| seen.insert(device.bus_id.clone()))
+        .collect()
+}
+
+fn dedup_devices_by_bus_id(devices: &mut Vec<UsbDevice>) {
+    let mut seen = HashSet::<String>::new();
+    devices.retain(|device| seen.insert(device.bus_id.clone()));
 }
 
 async fn reset_and_reopen_host_device(device: &UsbDevice) -> Option<UsbDevice> {

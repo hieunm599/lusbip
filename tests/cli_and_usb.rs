@@ -1,11 +1,12 @@
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::style::Color;
 use lusbip::cli::parse_hex_u16;
 use lusbip::client::{AttachedUsbPort, format_attached_port};
 use lusbip::server::{SharedDeviceView, format_shared_device_row};
 use lusbip::tui::{
     ListKeyAction, SelectionAction, TuiItem, label_with_spinner, list_key_action,
     merge_retained_items, next_index, optimistic_toggle_label, preserve_selected_index,
-    should_flush_startup_event, spinner_frame, truncate_to_width,
+    row_color_for_label, should_flush_startup_event, spinner_frame, truncate_to_width,
 };
 use lusbip::usb::{UsbDeviceSummary, matches_filter};
 
@@ -145,6 +146,18 @@ fn tui_truncates_long_rows_to_fixed_width() {
     assert_eq!(truncate_to_width("CP2102", 10), "CP2102");
     assert_eq!(truncate_to_width("CP2102", 3), "...");
     assert_eq!(truncate_to_width("CP2102", 0), "");
+}
+
+#[test]
+fn tui_marks_occupied_rows_with_distinct_color() {
+    assert_eq!(
+        row_color_for_label("[!] locked by 10.10.60.208 | 5-1 | CP2102", false),
+        Color::DarkRed
+    );
+    assert_eq!(
+        row_color_for_label("[ ] | 5-1 | CP2102 [occupied by 10.10.60.208]", false),
+        Color::DarkRed
+    );
 }
 
 #[test]

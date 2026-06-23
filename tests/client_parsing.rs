@@ -1,7 +1,7 @@
 use lusbip::client::{
     AttachTarget, AttachedUsbPort, RemoteUsbDevice, extract_occupied_by,
-    format_remote_device_state, friendly_client_error, parse_usbip_list_output,
-    parse_usbip_port_output, parse_vhci_status_ports, ports_to_detach,
+    format_remote_device_state, friendly_client_error, parse_remote_occupancy_status,
+    parse_usbip_list_output, parse_usbip_port_output, parse_vhci_status_ports, ports_to_detach,
     ports_to_detach_for_missing_remote_devices, remote_device_states,
 };
 
@@ -29,6 +29,32 @@ Exportable USB devices
             RemoteUsbDevice {
                 bus_id: "1-2".into(),
                 description: "Example Corp : Debug Probe (1234:5678)".into(),
+            },
+        ]
+    );
+}
+
+#[test]
+fn parses_usbip_list_output_deduplicates_repeated_bus_ids() {
+    let output = r#"
+Exportable USB devices
+======================
+ - 10.10.61.72
+      8-1: SanDisk Corp. : unknown product (0781:5597)
+      8-1: SanDisk Corp. : unknown product (0781:5597)
+      5-1.1: Silicon Labs : CP210x UART Bridge (10c4:ea60)
+"#;
+
+    assert_eq!(
+        parse_usbip_list_output(output),
+        vec![
+            RemoteUsbDevice {
+                bus_id: "8-1".into(),
+                description: "SanDisk Corp. : unknown product (0781:5597)".into(),
+            },
+            RemoteUsbDevice {
+                bus_id: "5-1.1".into(),
+                description: "Silicon Labs : CP210x UART Bridge (10c4:ea60)".into(),
             },
         ]
     );
@@ -202,6 +228,51 @@ fn remote_device_states_mark_attached_devices_by_remote_bus_id() {
 }
 
 #[test]
+fn remote_device_states_merge_attached_device_by_vid_pid_when_port_bus_id_is_missing() {
+    let devices = vec![RemoteUsbDevice {
+        bus_id: "5-1".into(),
+        description: "Silicon Labs : CP210x UART Bridge (10c4:ea60)".into(),
+    }];
+    let ports = vec![AttachedUsbPort {
+        port: "00".into(),
+        remote_host: Some("10.10.61.72".into()),
+        remote_bus_id: None,
+        vid_pid: Some("10c4:ea60".into()),
+    }];
+
+    let states = remote_device_states("10.10.61.72", &devices, &ports);
+
+    assert_eq!(states.len(), 1);
+    assert_eq!(states[0].attached_port.as_deref(), Some("00"));
+    assert_eq!(
+        format_remote_device_state(&states[0]),
+        "[x] port 00 | 5-1 | Silicon Labs : CP210x UART Bridge (10c4:ea60)"
+    );
+}
+
+#[test]
+fn remote_device_states_deduplicates_repeated_remote_bus_ids() {
+    let devices = vec![
+        RemoteUsbDevice {
+            bus_id: "8-1".into(),
+            description: "SanDisk Corp. : unknown product (0781:5597)".into(),
+        },
+        RemoteUsbDevice {
+            bus_id: "8-1".into(),
+            description: "SanDisk Corp. : unknown product (0781:5597)".into(),
+        },
+    ];
+
+    let states = remote_device_states("10.10.61.72", &devices, &[]);
+
+    assert_eq!(states.len(), 1);
+    assert_eq!(
+        format_remote_device_state(&states[0]),
+        "[ ] | 8-1 | SanDisk Corp. : unknown product (0781:5597)"
+    );
+}
+
+#[test]
 fn remote_device_states_mark_devices_occupied_by_other_client() {
     let devices = vec![RemoteUsbDevice {
         bus_id: "5-1".into(),
@@ -214,7 +285,31 @@ fn remote_device_states_mark_devices_occupied_by_other_client() {
     assert_eq!(states[0].occupied_by.as_deref(), Some("10.10.60.208"));
     assert_eq!(
         format_remote_device_state(&states[0]),
-        "[!] occupied by 10.10.60.208 | 5-1 | Silicon Labs : CP210x UART Bridge [occupied by 10.10.60.208] (10c4:ea60)"
+        "[!] locked by 10.10.60.208 | 5-1 | Silicon Labs : CP210x UART Bridge [occupied by 10.10.60.208] (10c4:ea60)"
+    );
+}
+
+#[test]
+fn remote_device_states_prefer_attached_status_over_occupied_marker() {
+    let devices = vec![RemoteUsbDevice {
+        bus_id: "5-1".into(),
+        description: "Silicon Labs : CP210x UART Bridge [occupied by 10.10.60.208] (10c4:ea60)"
+            .into(),
+    }];
+    let ports = vec![AttachedUsbPort {
+        port: "00".into(),
+        remote_host: Some("10.10.61.72".into()),
+        remote_bus_id: Some("5-1".into()),
+        vid_pid: Some("10c4:ea60".into()),
+    }];
+
+    let states = remote_device_states("10.10.61.72", &devices, &ports);
+
+    assert_eq!(states[0].occupied_by.as_deref(), Some("10.10.60.208"));
+    assert_eq!(states[0].attached_port.as_deref(), Some("00"));
+    assert_eq!(
+        format_remote_device_state(&states[0]),
+        "[x] port 00 | 5-1 | Silicon Labs : CP210x UART Bridge [occupied by 10.10.60.208] (10c4:ea60)"
     );
 }
 
@@ -225,6 +320,22 @@ fn parses_occupied_by_marker_from_description() {
         Some("10.10.60.208")
     );
     assert_eq!(extract_occupied_by("Device (1234:5678)"), None);
+}
+
+#[test]
+fn parses_remote_occupancy_status_endpoint() {
+    let status = "5-1.1\t10.10.60.208\n8-1\t10.10.60.209\n";
+
+    let occupancy = parse_remote_occupancy_status(status);
+
+    assert_eq!(
+        occupancy.get("5-1.1").map(String::as_str),
+        Some("10.10.60.208")
+    );
+    assert_eq!(
+        occupancy.get("8-1").map(String::as_str),
+        Some("10.10.60.209")
+    );
 }
 
 #[test]

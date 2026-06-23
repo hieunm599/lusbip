@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 use tokio::signal;
 use tokio::sync::{RwLock, mpsc};
@@ -284,6 +285,31 @@ async fn sync_server_devices(
     }
 }
 
+async fn serve_occupancy_status(addr: SocketAddr, occupancy: OccupancyMap) {
+    let listener = match TcpListener::bind(addr).await {
+        Ok(listener) => listener,
+        Err(err) => {
+            eprintln!("Unable to listen on occupancy status {addr}: {err}");
+            return;
+        }
+    };
+
+    loop {
+        let Ok((mut socket, _)) = listener.accept().await else {
+            continue;
+        };
+        let occupancy_snapshot = occupancy.read().await.clone();
+        tokio::spawn(async move {
+            let mut body = String::new();
+            for (bus_id, client) in occupancy_snapshot {
+                body.push_str(&format!("{bus_id}\t{}\n", client.ip()));
+            }
+            let _ = socket.write_all(body.as_bytes()).await;
+            let _ = socket.shutdown().await;
+        });
+    }
+}
+
 struct ServerTerminalGuard;
 
 impl ServerTerminalGuard {
@@ -483,6 +509,11 @@ pub async fn run_server(
         occupancy.clone(),
         port,
     ));
+    let occupancy_status_addr = SocketAddr::new(addr.ip(), port.saturating_add(1));
+    let occupancy_status_task = tokio::spawn(serve_occupancy_status(
+        occupancy_status_addr,
+        occupancy.clone(),
+    ));
 
     let task_server = server.clone();
     let server_occupancy = occupancy.clone();
@@ -527,6 +558,7 @@ pub async fn run_server(
         display_task.abort();
     }
     status_task.abort();
+    occupancy_status_task.abort();
     sync_task.abort();
     server_task.abort();
     match tokio::time::timeout(Duration::from_secs(5), server.cleanup()).await {

@@ -121,6 +121,21 @@ pub fn label_with_spinner(label: &str, frame: usize) -> String {
     format!("{label}  {}", spinner_frame(frame))
 }
 
+pub fn row_color_for_label(label: &str, is_processing: bool) -> Color {
+    if is_processing {
+        Color::Yellow
+    } else if label.starts_with("[x]") {
+        Color::Green
+    } else if label.starts_with("[!]")
+        || label.contains("occupied by")
+        || label.contains("locked by")
+    {
+        Color::DarkRed
+    } else {
+        Color::White
+    }
+}
+
 pub fn truncate_to_width(value: &str, width: usize) -> String {
     let char_count = value.chars().count();
     if char_count <= width {
@@ -515,15 +530,7 @@ fn draw_items(
         let is_processing = processing
             .as_ref()
             .is_some_and(|processing| processing.ids.contains(&item.id));
-        let row_color = if is_processing {
-            Color::Yellow
-        } else if item.label.starts_with("[x]") {
-            Color::Green
-        } else if item.label.starts_with("[!]") {
-            Color::Red
-        } else {
-            Color::White
-        };
+        let row_color = row_color_for_label(&item.label, is_processing);
         let row_bg = (selected == index).then_some(Color::DarkGrey);
         let label = if is_processing {
             label_with_spinner(&item.label, processing.as_ref().unwrap().frame)

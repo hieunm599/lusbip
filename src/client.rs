@@ -1,8 +1,11 @@
 use crate::process::{CommandRunner, StdCommandRunner};
 use crate::tui::{TuiItem, run_action_list, select_one};
+use std::collections::HashMap;
 use std::fs;
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Read};
+use std::net::TcpStream;
 use std::path::PathBuf;
+use std::time::Duration;
 
 const VHCI_STATUS_PATH: &str = "/sys/devices/platform/vhci_hcd.0/status";
 const VHCI_DETACH_PATH: &str = "/sys/devices/platform/vhci_hcd.0/detach";
@@ -667,7 +670,10 @@ fn load_remote_device_states(
 ) -> Result<Vec<RemoteUsbDeviceState>, String> {
     let devices = query_remote_devices(runner, remote, tcp_port)?;
     let ports = query_attached_ports_resilient(runner);
-    Ok(remote_device_states(remote, &devices, &ports))
+    let occupancy = query_remote_occupancy(remote, tcp_port).unwrap_or_default();
+    let mut states = remote_device_states(remote, &devices, &ports);
+    apply_remote_occupancy(&mut states, &occupancy);
+    Ok(states)
 }
 
 fn toggle_remote_device(
@@ -728,6 +734,7 @@ pub fn remote_device_states(
     ports: &[AttachedUsbPort],
 ) -> Vec<RemoteUsbDeviceState> {
     let mut used_ports = Vec::<String>::new();
+    let devices = unique_remote_devices(devices);
     let mut states = devices
         .iter()
         .map(|device| {
@@ -778,7 +785,7 @@ pub fn format_remote_device_state(state: &RemoteUsbDeviceState) -> String {
             state
                 .occupied_by
                 .as_deref()
-                .map(|client| format!("[!] occupied by {client}"))
+                .map(|client| format!("[!] locked by {client}"))
         })
         .unwrap_or_else(|| "[ ]".to_string());
 
@@ -794,6 +801,51 @@ pub fn extract_occupied_by(description: &str) -> Option<String> {
     let end = description[start..].find(']')? + start;
     let client = description[start..end].trim();
     (!client.is_empty()).then(|| client.to_string())
+}
+
+pub fn parse_remote_occupancy_status(status: &str) -> HashMap<String, String> {
+    status
+        .lines()
+        .filter_map(|line| {
+            let (bus_id, client) = line.split_once('\t')?;
+            let bus_id = bus_id.trim();
+            let client = client.trim();
+            if bus_id.is_empty() || client.is_empty() {
+                None
+            } else {
+                Some((bus_id.to_string(), client.to_string()))
+            }
+        })
+        .collect()
+}
+
+fn query_remote_occupancy(remote: &str, tcp_port: u16) -> Result<HashMap<String, String>, String> {
+    let status_port = tcp_port
+        .checked_add(1)
+        .ok_or_else(|| "Invalid TCP port for occupancy status".to_string())?;
+    let addr = format!("{remote}:{status_port}");
+    let mut stream = TcpStream::connect(&addr)
+        .map_err(|err| format!("Failed to connect occupancy status {addr}: {err}"))?;
+    stream
+        .set_read_timeout(Some(Duration::from_millis(300)))
+        .map_err(|err| format!("Failed to set occupancy status timeout: {err}"))?;
+
+    let mut status = String::new();
+    stream
+        .read_to_string(&mut status)
+        .map_err(|err| format!("Failed to read occupancy status {addr}: {err}"))?;
+    Ok(parse_remote_occupancy_status(&status))
+}
+
+fn apply_remote_occupancy(
+    states: &mut [RemoteUsbDeviceState],
+    occupancy: &HashMap<String, String>,
+) {
+    for state in states {
+        if let Some(client) = occupancy.get(&state.device.bus_id) {
+            state.occupied_by = Some(client.clone());
+        }
+    }
 }
 
 pub fn friendly_client_error(error: &str, remote: &str, tcp_port: u16) -> String {
@@ -842,10 +894,14 @@ fn port_matches_remote_device(
 ) -> bool {
     let host_bus_matches = port.remote_host.as_deref() == Some(remote)
         && port.remote_bus_id.as_deref() == Some(device.bus_id.as_str());
-    let unknown_host_vid_pid_matches = port.remote_host.is_none()
-        && vid_pid.is_some_and(|vid_pid| port.vid_pid.as_deref() == Some(vid_pid));
+    let vid_pid_matches = match (vid_pid, port.vid_pid.as_deref()) {
+        (Some(device_vid_pid), Some(port_vid_pid)) => device_vid_pid == port_vid_pid,
+        _ => false,
+    };
+    let host_vid_pid_matches = port.remote_host.as_deref() == Some(remote) && vid_pid_matches;
+    let unknown_host_vid_pid_matches = port.remote_host.is_none() && vid_pid_matches;
 
-    host_bus_matches || unknown_host_vid_pid_matches
+    host_bus_matches || host_vid_pid_matches || unknown_host_vid_pid_matches
 }
 
 fn attached_port_belongs_to_remote(remote: &str, port: &AttachedUsbPort) -> bool {
@@ -861,7 +917,7 @@ fn attached_port_description(port: &AttachedUsbPort) -> String {
 }
 
 pub fn parse_usbip_list_output(stdout: &str) -> Vec<RemoteUsbDevice> {
-    stdout
+    let devices = stdout
         .lines()
         .filter_map(|line| {
             let trimmed = line.trim();
@@ -887,7 +943,26 @@ pub fn parse_usbip_list_output(stdout: &str) -> Vec<RemoteUsbDevice> {
                 description: description.to_string(),
             })
         })
-        .collect()
+        .collect::<Vec<_>>();
+    unique_remote_devices(&devices)
+}
+
+fn unique_remote_devices(devices: &[RemoteUsbDevice]) -> Vec<RemoteUsbDevice> {
+    let mut seen_bus_ids = Vec::<String>::new();
+    let mut unique = Vec::<RemoteUsbDevice>::new();
+
+    for device in devices {
+        let bus_seen = seen_bus_ids.iter().any(|bus_id| bus_id == &device.bus_id);
+
+        if bus_seen {
+            continue;
+        }
+
+        seen_bus_ids.push(device.bus_id.clone());
+        unique.push(device.clone());
+    }
+
+    unique
 }
 
 pub fn parse_usbip_port_output(stdout: &str) -> Vec<AttachedUsbPort> {
