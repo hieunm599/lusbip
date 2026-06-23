@@ -392,6 +392,34 @@ impl UsbIpServer {
         Ok(usbip_resp)
     }
 
+    pub async fn handle_op_req_devlist_with_occupancy(
+        &self,
+        occupancy: &OccupancyMap,
+    ) -> Result<UsbIpResponse> {
+        trace!("Got OP_REQ_DEVLIST");
+        let mut devices = self.available_devices.read().await.clone();
+        let occupancy_snapshot = occupancy.read().await.clone();
+        let used_devices = self.used_devices.read().await;
+
+        for device in used_devices.iter() {
+            let mut occupied = device.clone();
+            if let Some(peer) = occupancy_snapshot.get(&occupied.bus_id) {
+                let product = occupied
+                    .string_pool
+                    .get(&occupied.string_product)
+                    .cloned()
+                    .unwrap_or_else(|| "Unknown".to_string());
+                occupied.string_product =
+                    occupied.new_string(&format!("{product} [occupied by {}]", peer.ip()));
+            }
+            devices.push(occupied);
+        }
+
+        let usbip_resp = UsbIpResponse::op_rep_devlist(&devices);
+        trace!("Sent OP_REP_DEVLIST");
+        Ok(usbip_resp)
+    }
+
     pub async fn handle_op_req_import(
         &self,
         busid: [u8; 32],
@@ -600,12 +628,20 @@ pub async fn handler<T: AsyncReadExt + AsyncWriteExt + Unpin>(
         };
 
         match command {
-            UsbIpCommand::OpReqDevlist { .. } => match server.handle_op_req_devlist().await {
-                Ok(r) => {
-                    r.write_to_socket(socket).await?;
+            UsbIpCommand::OpReqDevlist { .. } => {
+                let response = match &occupancy {
+                    Some((_, occupancy)) => {
+                        server.handle_op_req_devlist_with_occupancy(occupancy).await
+                    }
+                    None => server.handle_op_req_devlist().await,
+                };
+                match response {
+                    Ok(r) => {
+                        r.write_to_socket(socket).await?;
+                    }
+                    Err(e) => error!("UsbipCommand OpReqDevlist handling error: {e:?}"),
                 }
-                Err(e) => error!("UsbipCommand OpReqDevlist handling error: {e:?}"),
-            },
+            }
             UsbIpCommand::OpReqImport { busid, .. } => {
                 let previous_bus_id = imported_device.as_ref().map(|dev| dev.bus_id.clone());
                 match server.handle_op_req_import(busid, imported_device).await {

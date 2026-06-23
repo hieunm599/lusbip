@@ -32,6 +32,7 @@ pub struct AttachTarget {
 pub struct RemoteUsbDeviceState {
     pub device: RemoteUsbDevice,
     pub attached_port: Option<String>,
+    pub occupied_by: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -106,7 +107,8 @@ pub fn run_remote_control_tui(remote: &str, tcp_port: u16) -> Result<(), String>
         &title,
         move || {
             let runner = StdCommandRunner;
-            let states = load_remote_device_states(&runner, &load_remote, tcp_port)?;
+            let states = load_remote_device_states(&runner, &load_remote, tcp_port)
+                .map_err(|err| friendly_client_error(&err, &load_remote, tcp_port))?;
             Ok(states
                 .iter()
                 .map(|state| TuiItem {
@@ -117,13 +119,15 @@ pub fn run_remote_control_tui(remote: &str, tcp_port: u16) -> Result<(), String>
         },
         move |item| {
             let runner = StdCommandRunner;
-            let states = load_remote_device_states(&runner, &action_remote, tcp_port)?;
+            let states = load_remote_device_states(&runner, &action_remote, tcp_port)
+                .map_err(|err| friendly_client_error(&err, &action_remote, tcp_port))?;
             let selected = states
                 .iter()
                 .find(|state| state.device.bus_id == item.id)
                 .ok_or_else(|| "Selected USB device is no longer available".to_string())?
                 .clone();
             toggle_remote_device(&runner, &action_remote, tcp_port, &selected)
+                .map_err(|err| friendly_client_error(&err, &action_remote, tcp_port))
         },
         move || {
             let runner = StdCommandRunner;
@@ -676,6 +680,12 @@ fn toggle_remote_device(
         detach_port(runner, port)?;
         return Ok(format!("Detached USB/IP port {port}"));
     }
+    if let Some(client) = selected.occupied_by.as_deref() {
+        return Err(format!(
+            "USB device {} is occupied by {client}",
+            selected.device.bus_id
+        ));
+    }
 
     let target = AttachTarget {
         remote_host: remote.to_string(),
@@ -733,6 +743,7 @@ pub fn remote_device_states(
             RemoteUsbDeviceState {
                 device: device.clone(),
                 attached_port,
+                occupied_by: extract_occupied_by(&device.description),
             }
         })
         .collect::<Vec<_>>();
@@ -751,6 +762,7 @@ pub fn remote_device_states(
                 description: attached_port_description(port),
             },
             attached_port: Some(port.port.clone()),
+            occupied_by: None,
         });
     }
 
@@ -762,12 +774,64 @@ pub fn format_remote_device_state(state: &RemoteUsbDeviceState) -> String {
         .attached_port
         .as_deref()
         .map(|port| format!("[x] port {port}"))
+        .or_else(|| {
+            state
+                .occupied_by
+                .as_deref()
+                .map(|client| format!("[!] occupied by {client}"))
+        })
         .unwrap_or_else(|| "[ ]".to_string());
 
     format!(
         "{status} | {} | {}",
         state.device.bus_id, state.device.description
     )
+}
+
+pub fn extract_occupied_by(description: &str) -> Option<String> {
+    let marker = "[occupied by ";
+    let start = description.find(marker)? + marker.len();
+    let end = description[start..].find(']')? + start;
+    let client = description[start..end].trim();
+    (!client.is_empty()).then(|| client.to_string())
+}
+
+pub fn friendly_client_error(error: &str, remote: &str, tcp_port: u16) -> String {
+    let normalized = error.to_ascii_lowercase();
+    let doctor = format!("lusbip doctor --remote {remote} --tcp-port {tcp_port} --fix");
+
+    if normalized.contains("sudo:")
+        || normalized.contains("interactive authentication")
+        || normalized.contains("a password is required")
+    {
+        return format!("Cần quyền sudo. Chạy `sudo -v`, sau đó chạy `{doctor}`.");
+    }
+
+    if normalized.contains("open vhci_driver")
+        || normalized.contains("vhci")
+        || normalized.contains("list imported devices")
+        || normalized.contains("udev_device_new_from_subsystem_sysname")
+    {
+        return format!("Client chưa sẵn sàng USB/IP VHCI. Chạy `{doctor}`.");
+    }
+
+    if normalized.contains("failed to execute usbip") || normalized.contains("no such file") {
+        return format!("Thiếu công cụ usbip trên client. Chạy `{doctor}`.");
+    }
+
+    if normalized.contains("could not connect") || normalized.contains("connection refused") {
+        return format!(
+            "Không kết nối được server {remote}:{tcp_port}. Kiểm tra server hoặc chạy `{doctor}`."
+        );
+    }
+
+    first_error_line(error)
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("Lỗi client. Chạy `{doctor}` để kiểm tra."))
+}
+
+fn first_error_line(error: &str) -> Option<&str> {
+    error.lines().map(str::trim).find(|line| !line.is_empty())
 }
 
 fn port_matches_remote_device(

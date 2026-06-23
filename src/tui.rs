@@ -158,6 +158,8 @@ where
     let mut minimum_refresh_seq = 0u64;
     let mut post_action_processing: Option<ProcessingIndicator> = None;
     let mut sticky_items = Vec::<TuiItem>::new();
+    let mut dirty = true;
+    let mut last_spinner = Instant::now();
     let (refresh_tx, refresh_rx) = mpsc::channel::<u64>();
     let (items_tx, items_rx) = mpsc::channel::<(u64, Result<Vec<TuiItem>, String>)>();
     let (action_tx, action_rx) = mpsc::channel::<QueuedAction>();
@@ -189,6 +191,7 @@ where
                     post_action_processing = None;
                 }
             }
+            dirty = true;
 
             message = match result {
                 Ok(_) => {
@@ -233,37 +236,60 @@ where
                             next_items.push(sticky.clone());
                         }
                     }
-                    selected = preserve_selected_index(&items, &next_items, selected);
+                    let next_selected = preserve_selected_index(&items, &next_items, selected);
+                    if items != next_items || selected != next_selected {
+                        dirty = true;
+                    }
+                    selected = next_selected;
                     items = next_items;
                     if message
                         .as_deref()
                         .is_some_and(|value| value.starts_with("Error:"))
                     {
                         message = None;
+                        dirty = true;
                     }
                 }
                 Err(err) => {
                     message = Some(format!("Error: {err}"));
+                    dirty = true;
                 }
             }
         }
 
         if !items.is_empty() {
-            selected = selected.min(items.len() - 1);
+            let next_selected = selected.min(items.len() - 1);
+            if next_selected != selected {
+                dirty = true;
+            }
+            selected = next_selected;
         } else {
+            if selected != 0 {
+                dirty = true;
+            }
             selected = 0;
         }
-        draw_items(
-            title,
-            &items,
-            selected,
-            &[],
-            false,
-            message.as_deref(),
-            post_action_processing.as_ref(),
-        )?;
-        if let Some(processing) = post_action_processing.as_mut() {
-            processing.frame = processing.frame.wrapping_add(1);
+
+        if post_action_processing.is_some() && last_spinner.elapsed() >= Duration::from_millis(120)
+        {
+            if let Some(processing) = post_action_processing.as_mut() {
+                processing.frame = processing.frame.wrapping_add(1);
+            }
+            last_spinner = Instant::now();
+            dirty = true;
+        }
+
+        if dirty {
+            draw_items(
+                title,
+                &items,
+                selected,
+                &[],
+                false,
+                message.as_deref(),
+                post_action_processing.as_ref(),
+            )?;
+            dirty = false;
         }
 
         if !event::poll(Duration::from_millis(50))
@@ -279,10 +305,18 @@ where
 
         match event::read().map_err(|err| format!("Failed to read terminal event: {err}"))? {
             event if matches!(list_key_action(&event), Some(ListKeyAction::Up)) => {
-                selected = next_index(selected, items.len(), SelectionAction::Up);
+                let next_selected = next_index(selected, items.len(), SelectionAction::Up);
+                if next_selected != selected {
+                    selected = next_selected;
+                    dirty = true;
+                }
             }
             event if matches!(list_key_action(&event), Some(ListKeyAction::Down)) => {
-                selected = next_index(selected, items.len(), SelectionAction::Down);
+                let next_selected = next_index(selected, items.len(), SelectionAction::Down);
+                if next_selected != selected {
+                    selected = next_selected;
+                    dirty = true;
+                }
             }
             event if matches!(list_key_action(&event), Some(ListKeyAction::Activate)) => {
                 if items.is_empty() {
@@ -310,6 +344,7 @@ where
                             });
                         }
                     }
+                    dirty = true;
                 }
             }
             event if matches!(list_key_action(&event), Some(ListKeyAction::Background)) => {
@@ -321,6 +356,7 @@ where
                 })?;
                 selected = next_selected;
                 message = Some(result);
+                dirty = true;
                 if !message.as_deref().unwrap_or_default().starts_with("Error:") {
                     return Ok(());
                 }
@@ -483,6 +519,8 @@ fn draw_items(
             Color::Yellow
         } else if item.label.starts_with("[x]") {
             Color::Green
+        } else if item.label.starts_with("[!]") {
+            Color::Red
         } else {
             Color::White
         };

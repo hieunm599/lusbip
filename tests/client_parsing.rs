@@ -1,6 +1,7 @@
 use lusbip::client::{
-    AttachTarget, AttachedUsbPort, RemoteUsbDevice, format_remote_device_state,
-    parse_usbip_list_output, parse_usbip_port_output, parse_vhci_status_ports, ports_to_detach,
+    AttachTarget, AttachedUsbPort, RemoteUsbDevice, extract_occupied_by,
+    format_remote_device_state, friendly_client_error, parse_usbip_list_output,
+    parse_usbip_port_output, parse_vhci_status_ports, ports_to_detach,
     ports_to_detach_for_missing_remote_devices, remote_device_states,
 };
 
@@ -197,6 +198,60 @@ fn remote_device_states_mark_attached_devices_by_remote_bus_id() {
     assert_eq!(
         format_remote_device_state(&states[1]),
         "[ ] | 5-2 | Example : Debug Probe (1234:5678)"
+    );
+}
+
+#[test]
+fn remote_device_states_mark_devices_occupied_by_other_client() {
+    let devices = vec![RemoteUsbDevice {
+        bus_id: "5-1".into(),
+        description: "Silicon Labs : CP210x UART Bridge [occupied by 10.10.60.208] (10c4:ea60)"
+            .into(),
+    }];
+
+    let states = remote_device_states("10.10.61.72", &devices, &[]);
+
+    assert_eq!(states[0].occupied_by.as_deref(), Some("10.10.60.208"));
+    assert_eq!(
+        format_remote_device_state(&states[0]),
+        "[!] occupied by 10.10.60.208 | 5-1 | Silicon Labs : CP210x UART Bridge [occupied by 10.10.60.208] (10c4:ea60)"
+    );
+}
+
+#[test]
+fn parses_occupied_by_marker_from_description() {
+    assert_eq!(
+        extract_occupied_by("Device [occupied by 10.10.60.208] (1234:5678)").as_deref(),
+        Some("10.10.60.208")
+    );
+    assert_eq!(extract_occupied_by("Device (1234:5678)"), None);
+}
+
+#[test]
+fn friendly_client_error_summarizes_common_environment_failures() {
+    assert_eq!(
+        friendly_client_error(
+            "sudo: interactive authentication is required",
+            "10.10.61.72",
+            3240
+        ),
+        "Cần quyền sudo. Chạy `sudo -v`, sau đó chạy `lusbip doctor --remote 10.10.61.72 --tcp-port 3240 --fix`."
+    );
+    assert_eq!(
+        friendly_client_error(
+            "usbip port failed: usbip: error: open vhci_driver (is vhci_hcd loaded?)",
+            "10.10.61.72",
+            3240
+        ),
+        "Client chưa sẵn sàng USB/IP VHCI. Chạy `lusbip doctor --remote 10.10.61.72 --tcp-port 3240 --fix`."
+    );
+    assert_eq!(
+        friendly_client_error(
+            "usbip list failed: usbip: error: could not connect to 10.10.61.72:3240: System error",
+            "10.10.61.72",
+            3240
+        ),
+        "Không kết nối được server 10.10.61.72:3240. Kiểm tra server hoặc chạy `lusbip doctor --remote 10.10.61.72 --tcp-port 3240 --fix`."
     );
 }
 
