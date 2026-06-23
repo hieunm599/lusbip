@@ -3,8 +3,9 @@ use lusbip::cli::parse_hex_u16;
 use lusbip::client::{AttachedUsbPort, format_attached_port};
 use lusbip::server::{SharedDeviceView, format_shared_device_row};
 use lusbip::tui::{
-    ListKeyAction, SelectionAction, label_with_spinner, list_key_action, next_index,
-    optimistic_toggle_label, should_flush_startup_event, spinner_frame, truncate_to_width,
+    ListKeyAction, SelectionAction, TuiItem, label_with_spinner, list_key_action,
+    merge_retained_items, next_index, optimistic_toggle_label, preserve_selected_index,
+    should_flush_startup_event, spinner_frame, truncate_to_width,
 };
 use lusbip::usb::{UsbDeviceSummary, matches_filter};
 
@@ -46,6 +47,56 @@ fn tui_index_wraps_for_navigation() {
 }
 
 #[test]
+fn tui_preserves_selected_item_by_id_after_refresh_reorders_rows() {
+    let previous = vec![
+        TuiItem {
+            id: "5-1".into(),
+            label: "[ ] | 5-1 | CP2102".into(),
+        },
+        TuiItem {
+            id: "8-1".into(),
+            label: "[ ] | 8-1 | SanDisk".into(),
+        },
+    ];
+    let next = vec![
+        TuiItem {
+            id: "8-1".into(),
+            label: "[x] port 00 | 8-1 | SanDisk".into(),
+        },
+        TuiItem {
+            id: "5-1".into(),
+            label: "[ ] | 5-1 | CP2102".into(),
+        },
+    ];
+
+    assert_eq!(preserve_selected_index(&previous, &next, 1), 0);
+}
+
+#[test]
+fn tui_keeps_pending_items_when_refresh_temporarily_omits_them() {
+    let previous = vec![
+        TuiItem {
+            id: "5-1".into(),
+            label: "[ ] | 5-1 | CP2102".into(),
+        },
+        TuiItem {
+            id: "8-1".into(),
+            label: "[ ] | 8-1 | SanDisk".into(),
+        },
+    ];
+    let next = vec![TuiItem {
+        id: "5-1".into(),
+        label: "[ ] | 5-1 | CP2102".into(),
+    }];
+    let retained = vec!["8-1".to_string()];
+
+    let merged = merge_retained_items(&previous, &next, &retained);
+
+    assert_eq!(merged.len(), 2);
+    assert!(merged.iter().any(|item| item.id == "8-1"));
+}
+
+#[test]
 fn tui_flushes_startup_enter_key_before_selection_loop() {
     let enter = Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
@@ -60,7 +111,7 @@ fn tui_maps_space_to_activate_and_enter_to_noop() {
 
     assert_eq!(list_key_action(&space), Some(ListKeyAction::Activate));
     assert_eq!(list_key_action(&enter), None);
-    assert_eq!(list_key_action(&esc), Some(ListKeyAction::Cancel));
+    assert_eq!(list_key_action(&esc), Some(ListKeyAction::Background));
 }
 
 #[test]

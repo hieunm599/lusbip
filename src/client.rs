@@ -115,11 +115,12 @@ pub fn run_remote_control_tui(remote: &str, tcp_port: u16) -> Result<(), String>
                 })
                 .collect())
         },
-        move |index| {
+        move |item| {
             let runner = StdCommandRunner;
             let states = load_remote_device_states(&runner, &action_remote, tcp_port)?;
             let selected = states
-                .get(index)
+                .iter()
+                .find(|state| state.device.bus_id == item.id)
                 .ok_or_else(|| "Selected USB device is no longer available".to_string())?
                 .clone();
             toggle_remote_device(&runner, &action_remote, tcp_port, &selected)
@@ -662,17 +663,7 @@ fn load_remote_device_states(
 ) -> Result<Vec<RemoteUsbDeviceState>, String> {
     let devices = query_remote_devices(runner, remote, tcp_port)?;
     let ports = query_attached_ports_resilient(runner);
-    let stale_ports = ports_to_detach_for_missing_remote_devices(remote, &devices, &ports);
-
-    for port in &stale_ports {
-        let _ = detach_port(runner, port);
-    }
-
-    let current_ports = ports
-        .into_iter()
-        .filter(|port| !stale_ports.contains(&port.port))
-        .collect::<Vec<_>>();
-    Ok(remote_device_states(remote, &devices, &current_ports))
+    Ok(remote_device_states(remote, &devices, &ports))
 }
 
 fn toggle_remote_device(
@@ -753,7 +744,10 @@ pub fn remote_device_states(
 
         states.push(RemoteUsbDeviceState {
             device: RemoteUsbDevice {
-                bus_id: format!("attached-port-{}", port.port),
+                bus_id: port
+                    .remote_bus_id
+                    .clone()
+                    .unwrap_or_else(|| format!("attached-port-{}", port.port)),
                 description: attached_port_description(port),
             },
             attached_port: Some(port.port.clone()),

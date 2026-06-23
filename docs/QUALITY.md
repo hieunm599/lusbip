@@ -136,7 +136,8 @@ Trong màn client:
 - Nhấn Space trên dòng `[x]` để detach USB/IP port tương ứng.
 - Enter không thực hiện attach/detach trong client UI.
 - Khi attach/detach đang chạy, UI hiển thị spinner ở đuôi dòng thiết bị đang xử lý, không in log thành công, và giữ nguyên màn hình sau khi command hoàn tất.
-- Khi thoát TUI bằng Esc hoặc Ctrl+C, client phải detach các USB/IP port đang attached trong màn hiện tại rồi mới thoát.
+- Khi nhấn Esc, client thoát UI và giữ các USB/IP port đang attached chạy nền.
+- Khi nhấn Ctrl+C, client phải detach các USB/IP port đang attached trong màn hiện tại rồi mới thoát.
 
 Kết quả chấp nhận:
 

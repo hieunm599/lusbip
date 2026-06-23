@@ -14,6 +14,7 @@ async fn main() {
                 args.vid,
                 args.pid,
                 args.bus_id.as_deref(),
+                args.background,
             )
             .await
         }

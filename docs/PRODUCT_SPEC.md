@@ -49,12 +49,14 @@ Mặc định:
 - `list` in bảng thiết bị USB cục bộ: bus id, address, VID:PID, manufacturer, product, serial.
 - `server` không filter thì export tất cả thiết bị USB local mà module USB/IP nội bộ thấy được.
 - `server` có filter thì chỉ export thiết bị match filter và chạy ở chế độ log text.
+- Trong màn server, Esc chuyển server sang process nền; Ctrl+C dừng server và release thiết bị.
 - `client`/`attach` có `--bus-id` thì attach trực tiếp.
 - `client` không có `--bus-id`; command này query remote device và mở UI để chọn/toggle attach.
 - `client --remote <IP>` query remote device và attached ports, hiển thị mỗi cổng USB remote cùng trạng thái `[x]` nếu attached hoặc `[ ]` nếu detached.
 - Trong màn client, Space trên cổng `[ ]` sẽ attach; Space trên cổng `[x]` sẽ detach USB/IP port tương ứng. Enter không thực hiện action.
 - Khi attach/detach đang xử lý lâu, UI chỉ hiển thị spinner quay ở đuôi dòng thiết bị đang xử lý, và refresh trạng thái sau khi command hoàn tất mà không thoát màn hình.
-- Khi thoát TUI bằng Esc hoặc Ctrl+C, client detach các USB/IP port đang attached trong màn hiện tại rồi mới thoát.
+- Khi nhấn Esc trong client TUI, client thoát màn UI và giữ các USB/IP port đang attached chạy nền.
+- Khi nhấn Ctrl+C trong client TUI, client detach các USB/IP port đang attached trong màn hiện tại rồi mới thoát.
 - Trước khi attach, `client`/`attach` phải kiểm tra `usbip port` và tự detach stale port liên quan đến remote host/bus id/VID:PID hiện tại.
 - Không detach toàn bộ USB/IP port bừa bãi. Nếu không xác định chắc port nào thuộc target hiện tại, CLI phải hỏi người dùng hoặc fail rõ với output `usbip port`.
 - `detach --port <PORT>` chạy `sudo usbip detach -p <PORT>` để gỡ thủ công một USB/IP port.

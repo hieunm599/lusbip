@@ -65,7 +65,17 @@ fn parses_server_defaults() {
 
     assert!(matches!(
         cli.command,
-        Commands::Server(args) if args.host == "0.0.0.0" && args.port == 3240
+        Commands::Server(args) if args.host == "0.0.0.0" && args.port == 3240 && !args.background
+    ));
+}
+
+#[test]
+fn parses_server_background_mode() {
+    let cli = Cli::parse_from(["lusbip", "server", "--background"]);
+
+    assert!(matches!(
+        cli.command,
+        Commands::Server(args) if args.background
     ));
 }
 

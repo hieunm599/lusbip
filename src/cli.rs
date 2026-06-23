@@ -42,6 +42,8 @@ pub struct ServerArgs {
     pub host: String,
     #[arg(short, long, default_value_t = 3240)]
     pub port: u16,
+    #[arg(long)]
+    pub background: bool,
 }
 
 #[derive(Debug, Args)]

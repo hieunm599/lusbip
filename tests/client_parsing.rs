@@ -221,6 +221,26 @@ fn remote_device_states_keep_attached_ports_when_remote_export_is_empty() {
 }
 
 #[test]
+fn remote_device_states_keep_remote_bus_id_for_attached_ports_missing_from_export() {
+    let ports = vec![AttachedUsbPort {
+        port: "00".into(),
+        remote_host: Some("10.10.61.72".into()),
+        remote_bus_id: Some("8-1".into()),
+        vid_pid: Some("0781:5597".into()),
+    }];
+
+    let states = remote_device_states("10.10.61.72", &[], &ports);
+
+    assert_eq!(states.len(), 1);
+    assert_eq!(states[0].attached_port.as_deref(), Some("00"));
+    assert_eq!(states[0].device.bus_id, "8-1");
+    assert_eq!(
+        format_remote_device_state(&states[0]),
+        "[x] port 00 | 8-1 | Attached USB/IP device (0781:5597)"
+    );
+}
+
+#[test]
 fn parses_stale_vhci_ports_from_kernel_status() {
     let status = r#"
 hub port sta spd dev      sockfd local_busid

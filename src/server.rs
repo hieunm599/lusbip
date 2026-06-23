@@ -1,13 +1,94 @@
 use std::collections::HashMap;
+use std::fs;
 use std::io::{self, Write};
 use std::net::{IpAddr, SocketAddr};
+use std::path::PathBuf;
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crossterm::event::{self, Event, KeyCode, KeyModifiers};
+use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+use tokio::net::TcpListener;
 use tokio::signal;
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, mpsc};
 
 use crate::usbip_server::{OccupancyMap, UsbIpServer};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServerControl {
+    Background,
+    Stop,
+}
+
+fn server_pid_path(port: u16) -> PathBuf {
+    std::env::temp_dir().join(format!("lusbip-server-{port}.pid"))
+}
+
+fn server_status_path(port: u16) -> PathBuf {
+    std::env::temp_dir().join(format!("lusbip-server-{port}.status"))
+}
+
+fn write_server_pid(port: u16) {
+    let _ = fs::write(server_pid_path(port), std::process::id().to_string());
+}
+
+fn remove_server_pid(port: u16) {
+    let path = server_pid_path(port);
+    if fs::read_to_string(&path)
+        .ok()
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        == Some(std::process::id())
+    {
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(server_status_path(port));
+    }
+}
+
+fn active_server_pid(port: u16) -> Option<u32> {
+    let pid = fs::read_to_string(server_pid_path(port))
+        .ok()?
+        .trim()
+        .parse::<u32>()
+        .ok()?;
+    PathBuf::from("/proc")
+        .join(pid.to_string())
+        .exists()
+        .then_some(pid)
+}
+
+fn listen_error_message(addr: SocketAddr, port: u16, err: io::Error) -> String {
+    if err.kind() == io::ErrorKind::AddrInUse {
+        if let Some(pid) = active_server_pid(port) {
+            return format!(
+                "LUSBIP server is already running on {addr} (pid {pid}). Use `sudo kill {pid}` to stop it, or keep using the background server."
+            );
+        }
+        return format!(
+            "Port {addr} is already in use. Another process is listening on this port; stop it or choose `--port <PORT>`."
+        );
+    }
+    format!("Cannot listen on {addr}: {err}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::listen_error_message;
+    use std::io;
+    use std::net::SocketAddr;
+
+    #[test]
+    fn listen_error_message_explains_address_in_use() {
+        let addr: SocketAddr = "0.0.0.0:3240".parse().unwrap();
+        let message = listen_error_message(
+            addr,
+            3240,
+            io::Error::new(io::ErrorKind::AddrInUse, "Address in use"),
+        );
+
+        assert!(message.contains("already in use") || message.contains("already running"));
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SharedDeviceView {
@@ -121,6 +202,22 @@ async fn render_server_status(
     }
 }
 
+async fn write_server_status_snapshots(
+    addr: SocketAddr,
+    filter: ServerDeviceFilter,
+    occupancy: OccupancyMap,
+    port: u16,
+) {
+    let mut interval = tokio::time::interval(Duration::from_millis(1000));
+    let path = server_status_path(port);
+
+    loop {
+        interval.tick().await;
+        let rendered = build_server_status(addr, &filter, &occupancy).await;
+        let _ = fs::write(&path, rendered);
+    }
+}
+
 fn client_ip_string(ip: IpAddr) -> String {
     ip.to_string()
 }
@@ -132,21 +229,21 @@ async fn build_server_status(
 ) -> String {
     let occupancy_snapshot = occupancy.read().await.clone();
     let mut rendered = String::new();
-    rendered.push_str(&format!("LUSBIP USB/IP server listening on {addr}\n"));
-    rendered.push_str("Press Ctrl+C to stop and release devices.\n\n");
-    rendered.push_str("Bus ID | VID:PID | Product | Status\n");
-    rendered.push_str("------------------------------------\n");
+    rendered.push_str(&format!("LUSBIP USB/IP server listening on {addr}\r\n"));
+    rendered.push_str("Esc: background | Ctrl+C: stop and release devices.\r\n\r\n");
+    rendered.push_str("Bus ID | VID:PID | Product | Status\r\n");
+    rendered.push_str("------------------------------------\r\n");
 
     let views = match nusb::list_devices().await {
         Ok(devices) => shared_device_views(&devices.collect::<Vec<_>>(), filter),
         Err(err) => {
-            rendered.push_str(&format!("Unable to refresh USB list: {err}\n"));
+            rendered.push_str(&format!("Unable to refresh USB list: {err}\r\n"));
             Vec::new()
         }
     };
 
     if views.is_empty() {
-        rendered.push_str("(no matching USB devices currently plugged in)\n");
+        rendered.push_str("(no matching USB devices currently plugged in)\r\n");
         return rendered;
     }
 
@@ -155,7 +252,7 @@ async fn build_server_status(
         row.client = occupancy_snapshot
             .get(&row.bus_id)
             .map(|addr| client_ip_string(addr.ip()));
-        rendered.push_str(&format!("{}\n", format_shared_device_row(&row)));
+        rendered.push_str(&format!("{}\r\n", format_shared_device_row(&row)));
     }
 
     rendered
@@ -187,12 +284,153 @@ async fn sync_server_devices(
     }
 }
 
+struct ServerTerminalGuard;
+
+impl ServerTerminalGuard {
+    fn enter() -> Result<Self, String> {
+        enable_raw_mode().map_err(|err| format!("Failed to enable server key mode: {err}"))?;
+        Ok(Self)
+    }
+}
+
+impl Drop for ServerTerminalGuard {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+    }
+}
+
+fn spawn_server_control_listener()
+-> Result<(ServerTerminalGuard, mpsc::UnboundedReceiver<ServerControl>), String> {
+    let terminal = ServerTerminalGuard::enter()?;
+    let (tx, rx) = mpsc::unbounded_channel();
+
+    std::thread::spawn(move || {
+        loop {
+            match event::poll(Duration::from_millis(100)) {
+                Ok(true) => match event::read() {
+                    Ok(Event::Key(key)) if key.code == KeyCode::Esc => {
+                        let _ = tx.send(ServerControl::Background);
+                    }
+                    Ok(Event::Key(key))
+                        if key.code == KeyCode::Char('c')
+                            && key.modifiers.contains(KeyModifiers::CONTROL) =>
+                    {
+                        let _ = tx.send(ServerControl::Stop);
+                        return;
+                    }
+                    Ok(_) => {}
+                    Err(_) => return,
+                },
+                Ok(false) => {}
+                Err(_) => return,
+            }
+        }
+    });
+
+    Ok((terminal, rx))
+}
+
+fn spawn_background_server(
+    host: &str,
+    port: u16,
+    vid: Option<u16>,
+    pid: Option<u16>,
+    bus_id: Option<&str>,
+) -> Result<(), String> {
+    let exe =
+        std::env::current_exe().map_err(|err| format!("Cannot locate current binary: {err}"))?;
+    let mut command = std::process::Command::new(exe);
+    command
+        .arg("server")
+        .arg("--host")
+        .arg(host)
+        .arg("--port")
+        .arg(port.to_string())
+        .arg("--background")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+    if let Some(vid) = vid {
+        command.arg("--vid").arg(format!("{vid:04x}"));
+    }
+    if let Some(pid) = pid {
+        command.arg("--pid").arg(format!("{pid:04x}"));
+    }
+    if let Some(bus_id) = bus_id {
+        command.arg("--bus-id").arg(bus_id);
+    }
+
+    command
+        .spawn()
+        .map(|_| ())
+        .map_err(|err| format!("Failed to start background server: {err}"))
+}
+
+async fn attach_existing_server_view(addr: SocketAddr, port: u16, pid: u32) -> Result<(), String> {
+    let _terminal = ServerTerminalGuard::enter()?;
+    let status_path = server_status_path(port);
+    let mut last_rendered = String::new();
+
+    loop {
+        if event::poll(Duration::from_millis(100))
+            .map_err(|err| format!("Failed to poll server viewer event: {err}"))?
+        {
+            match event::read()
+                .map_err(|err| format!("Failed to read server viewer event: {err}"))?
+            {
+                Event::Key(key) if key.code == KeyCode::Esc => {
+                    print!("\r\nDetached from LUSBIP server view. Server keeps running.\r\n");
+                    let _ = io::stdout().flush();
+                    return Ok(());
+                }
+                Event::Key(key)
+                    if key.code == KeyCode::Char('c')
+                        && key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    print!("\r\nStopping background LUSBIP server pid {pid}...\r\n");
+                    let _ = io::stdout().flush();
+                    let status = std::process::Command::new("kill")
+                        .arg(pid.to_string())
+                        .status()
+                        .map_err(|err| format!("Failed to stop server pid {pid}: {err}"))?;
+                    if status.success() {
+                        remove_server_pid(port);
+                        return Ok(());
+                    }
+                    return Err(format!("Failed to stop server pid {pid}"));
+                }
+                _ => {}
+            }
+        }
+
+        let rendered = fs::read_to_string(&status_path).unwrap_or_else(|_| {
+            format!(
+                "LUSBIP USB/IP server already running on {addr} (pid {pid})\r\n\
+                 Waiting for status snapshot...\r\n\r\n\
+                 Esc: detach view | Ctrl+C: stop background server\r\n"
+            )
+        });
+        let rendered = rendered.replace(
+            "Esc: background | Ctrl+C: stop and release devices.",
+            "Esc: detach view | Ctrl+C: stop background server.",
+        );
+
+        if rendered != last_rendered {
+            print!("\x1b[2J\x1b[H{rendered}");
+            let _ = io::stdout().flush();
+            last_rendered = rendered;
+        }
+    }
+}
+
 pub async fn run_server(
     host: &str,
     port: u16,
     vid: Option<u16>,
     pid: Option<u16>,
     bus_id: Option<&str>,
+    background: bool,
 ) -> Result<(), String> {
     let filter = ServerDeviceFilter {
         vid,
@@ -207,14 +445,29 @@ pub async fn run_server(
     let addr: SocketAddr = format!("{host}:{port}")
         .parse()
         .map_err(|err| format!("Invalid listen address {host}:{port}: {err}"))?;
+    let listener = match TcpListener::bind(addr).await {
+        Ok(listener) => listener,
+        Err(err) if err.kind() == io::ErrorKind::AddrInUse => {
+            if let Some(pid) = active_server_pid(port) {
+                return attach_existing_server_view(addr, port, pid).await;
+            }
+            return Err(listen_error_message(addr, port, err));
+        }
+        Err(err) => return Err(listen_error_message(addr, port, err)),
+    };
+    write_server_pid(port);
 
     let occupancy: OccupancyMap = Arc::new(RwLock::new(HashMap::new()));
-    let display_occupancy = occupancy.clone();
-    let display_task = tokio::spawn(render_server_status(
-        addr,
-        filter.clone(),
-        display_occupancy,
-    ));
+    let display_task = if background {
+        None
+    } else {
+        let display_occupancy = occupancy.clone();
+        Some(tokio::spawn(render_server_status(
+            addr,
+            filter.clone(),
+            display_occupancy,
+        )))
+    };
 
     let sync_server = server.clone();
     let sync_occupancy = occupancy.clone();
@@ -224,19 +477,56 @@ pub async fn run_server(
         sync_filter,
         sync_occupancy,
     ));
+    let status_task = tokio::spawn(write_server_status_snapshots(
+        addr,
+        filter.clone(),
+        occupancy.clone(),
+        port,
+    ));
 
     let task_server = server.clone();
     let server_occupancy = occupancy.clone();
     let server_task = tokio::spawn(async move {
-        crate::usbip_server::server_with_occupancy(addr, task_server, server_occupancy).await;
+        crate::usbip_server::server_with_occupancy_listener(
+            listener,
+            task_server,
+            server_occupancy,
+        )
+        .await;
     });
 
-    signal::ctrl_c()
-        .await
-        .map_err(|err| format!("Failed to wait for Ctrl+C: {err}"))?;
+    let should_background = if background {
+        signal::ctrl_c()
+            .await
+            .map_err(|err| format!("Failed to wait for Ctrl+C: {err}"))?;
+        false
+    } else {
+        let (_terminal, mut control_rx) = spawn_server_control_listener()?;
+        loop {
+            match control_rx.recv().await {
+                Some(ServerControl::Background) => {
+                    if occupancy.read().await.is_empty() {
+                        break true;
+                    }
+                    print!(
+                        "\r\nCannot move to background while clients are attached; keep this server running or detach clients first.\r\n"
+                    );
+                    let _ = io::stdout().flush();
+                }
+                Some(ServerControl::Stop) | None => break false,
+            }
+        }
+    };
 
-    println!("Stopping LUSBIP server and releasing devices...");
-    display_task.abort();
+    if should_background {
+        print!("\r\nMoving LUSBIP server to background...\r\n");
+    } else if !background {
+        print!("\r\nStopping LUSBIP server and releasing devices...\r\n");
+    }
+    if let Some(display_task) = display_task {
+        display_task.abort();
+    }
+    status_task.abort();
     sync_task.abort();
     server_task.abort();
     match tokio::time::timeout(Duration::from_secs(5), server.cleanup()).await {
@@ -244,6 +534,11 @@ pub async fn run_server(
         Err(_) => {
             eprintln!("Timed out while releasing USB devices; exiting server shutdown.");
         }
+    }
+    remove_server_pid(port);
+    if should_background {
+        spawn_background_server(host, port, vid, pid, bus_id)?;
+        print!("LUSBIP server is running in background on {host}:{port}.\r\n");
     }
     Ok(())
 }

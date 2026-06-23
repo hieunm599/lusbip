@@ -37,7 +37,7 @@ Server:
 - Không có màn chọn attach/detach ở server.
 - `server` mặc định export tất cả thiết bị USB local mà module USB/IP nội bộ thấy được.
 - Filter `--vid`, `--pid`, `--bus-id` chỉ dùng để giới hạn danh sách export khi cần.
-- Ctrl+C dừng server, cleanup và release device.
+- Esc chuyển server sang process nền; Ctrl+C dừng server, cleanup và release device.
 
 Client TUI:
 
@@ -47,8 +47,8 @@ Client TUI:
 - Space trên dòng `[ ]` sẽ chạy attach cho bus id tương ứng.
 - Space trên dòng `[x]` sẽ chạy detach USB/IP port tương ứng. Enter không thực hiện action trong client TUI.
 - Trong khi chạy attach/detach blocking, redraw TUI định kỳ với spinner ở đuôi dòng thiết bị đang xử lý; sau khi command hoàn tất, reload danh sách và giữ nguyên màn hình.
-- Khi nhận Esc hoặc Ctrl+C, client TUI chạy cleanup detach cho các port đang attached trong danh sách hiện tại, sau đó restore terminal và thoát.
-- Esc/Ctrl+C hủy.
+- Khi nhận Esc, client TUI restore terminal và thoát UI nhưng giữ USB/IP port đang attached.
+- Khi nhận Ctrl+C, client TUI chạy cleanup detach cho các port đang attached trong danh sách hiện tại, sau đó restore terminal và thoát.
 
 Yêu cầu terminal:
 

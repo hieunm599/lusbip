@@ -127,6 +127,11 @@ Chạy server:
 sudo ~/bin/lusbip server --host 0.0.0.0 --port 3240
 ```
 
+Trong màn server:
+
+- `Esc`: chuyển server sang process nền.
+- `Ctrl+C`: dừng server và release thiết bị.
+
 Server vẫn mở được khi chưa cắm CP2102. Khi cắm CP2102 sau, danh sách sẽ tự cập nhật trong khoảng 1 giây.
 
 Các lỗi thường gặp trên Nano Pi:
@@ -167,7 +172,8 @@ Phím trong UI:
 
 - `↑/↓` hoặc `j/k`: di chuyển.
 - `Space`: attach/detach thiết bị đang chọn.
-- `Esc` hoặc `Ctrl+C`: detach các port đang attached trong màn hiện tại rồi thoát.
+- `Esc`: thoát màn UI, giữ các USB/IP port đang attached chạy nền.
+- `Ctrl+C`: detach các port đang attached trong màn hiện tại rồi thoát.
 
 Trạng thái:
 

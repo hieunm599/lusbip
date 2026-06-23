@@ -705,7 +705,15 @@ pub async fn server_with_occupancy(
     occupancy: OccupancyMap,
 ) {
     let listener = TcpListener::bind(addr).await.expect("bind to addr");
+    server_with_occupancy_listener(listener, server, occupancy).await;
+}
 
+/// Run a USB/IP server from an already-bound listener and track which peer occupies each bus id.
+pub async fn server_with_occupancy_listener(
+    listener: TcpListener,
+    server: Arc<UsbIpServer>,
+    occupancy: OccupancyMap,
+) {
     while let Ok((mut socket, _addr)) = listener.accept().await {
         let peer_addr = match socket.peer_addr() {
             Ok(addr) => addr,

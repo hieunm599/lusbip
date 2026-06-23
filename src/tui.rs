@@ -26,6 +26,7 @@ pub enum ListKeyAction {
     Up,
     Down,
     Activate,
+    Background,
     Cancel,
 }
 
@@ -35,10 +36,16 @@ pub struct TuiItem {
     pub label: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ProcessingIndicator {
-    index: usize,
     frame: usize,
+    ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct QueuedAction {
+    item: TuiItem,
+    action_was_attach: bool,
 }
 
 pub fn next_index(current: usize, len: usize, action: SelectionAction) -> usize {
@@ -53,6 +60,38 @@ pub fn next_index(current: usize, len: usize, action: SelectionAction) -> usize 
     }
 }
 
+pub fn preserve_selected_index(
+    previous_items: &[TuiItem],
+    next_items: &[TuiItem],
+    selected: usize,
+) -> usize {
+    let Some(previous_id) = previous_items.get(selected).map(|item| item.id.as_str()) else {
+        return selected.min(next_items.len().saturating_sub(1));
+    };
+
+    next_items
+        .iter()
+        .position(|item| item.id == previous_id)
+        .unwrap_or_else(|| selected.min(next_items.len().saturating_sub(1)))
+}
+
+pub fn merge_retained_items(
+    previous_items: &[TuiItem],
+    next_items: &[TuiItem],
+    retained_ids: &[String],
+) -> Vec<TuiItem> {
+    let mut merged = next_items.to_vec();
+    for id in retained_ids {
+        if merged.iter().any(|item| &item.id == id) {
+            continue;
+        }
+        if let Some(item) = previous_items.iter().find(|item| &item.id == id) {
+            merged.push(item.clone());
+        }
+    }
+    merged
+}
+
 pub fn should_flush_startup_event(event: &Event) -> bool {
     matches!(event, Event::Key(_))
 }
@@ -63,7 +102,7 @@ pub fn list_key_action(event: &Event) -> Option<ListKeyAction> {
             KeyCode::Up | KeyCode::Char('k') => Some(ListKeyAction::Up),
             KeyCode::Down | KeyCode::Char('j') => Some(ListKeyAction::Down),
             KeyCode::Char(' ') => Some(ListKeyAction::Activate),
-            KeyCode::Esc => Some(ListKeyAction::Cancel),
+            KeyCode::Esc => Some(ListKeyAction::Background),
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 Some(ListKeyAction::Cancel)
             }
@@ -101,12 +140,12 @@ pub fn truncate_to_width(value: &str, width: usize) -> String {
 pub fn run_action_list<LoadItems, Activate, Exit>(
     title: &str,
     mut load_items: LoadItems,
-    mut activate: Activate,
+    activate: Activate,
     mut exit: Exit,
 ) -> Result<(), String>
 where
     LoadItems: FnMut() -> Result<Vec<TuiItem>, String> + Send + 'static,
-    Activate: FnMut(usize) -> Result<String, String> + Send,
+    Activate: FnMut(TuiItem) -> Result<String, String> + Send + 'static,
     Exit: FnMut() -> Result<(), String> + Send,
 {
     let mut terminal = TerminalGuard::enter()?;
@@ -118,8 +157,12 @@ where
     let mut refresh_seq = 0u64;
     let mut minimum_refresh_seq = 0u64;
     let mut post_action_processing: Option<ProcessingIndicator> = None;
+    let mut sticky_items = Vec::<TuiItem>::new();
     let (refresh_tx, refresh_rx) = mpsc::channel::<u64>();
     let (items_tx, items_rx) = mpsc::channel::<(u64, Result<Vec<TuiItem>, String>)>();
+    let (action_tx, action_rx) = mpsc::channel::<QueuedAction>();
+    let (action_result_tx, action_result_rx) =
+        mpsc::channel::<(QueuedAction, Result<String, String>)>();
 
     thread::spawn(move || {
         while let Ok(seq) = refresh_rx.recv() {
@@ -128,8 +171,49 @@ where
             }
         }
     });
+    thread::spawn(move || {
+        let mut activate = activate;
+        while let Ok(action) = action_rx.recv() {
+            let result = activate(action.item.clone());
+            if action_result_tx.send((action, result)).is_err() {
+                break;
+            }
+        }
+    });
 
     loop {
+        while let Ok((action, result)) = action_result_rx.try_recv() {
+            if let Some(processing) = post_action_processing.as_mut() {
+                processing.ids.retain(|id| id != &action.item.id);
+                if processing.ids.is_empty() {
+                    post_action_processing = None;
+                }
+            }
+
+            message = match result {
+                Ok(_) => {
+                    if let Some(item) = items.iter_mut().find(|item| item.id == action.item.id) {
+                        item.label = optimistic_toggle_label(&item.label, action.action_was_attach);
+                        if action.action_was_attach
+                            && !sticky_items.iter().any(|sticky| sticky.id == item.id)
+                        {
+                            sticky_items.push(item.clone());
+                        }
+                    }
+                    if !action.action_was_attach {
+                        sticky_items.retain(|sticky| sticky.id != action.item.id);
+                    }
+                    None
+                }
+                Err(err) => Some(format!("Error: {err}")),
+            };
+
+            refresh_seq = refresh_seq.wrapping_add(1);
+            minimum_refresh_seq = refresh_seq;
+            refresh_pending = refresh_tx.send(refresh_seq).is_ok();
+            last_refresh = Instant::now();
+        }
+
         while let Ok((seq, result)) = items_rx.try_recv() {
             if seq < minimum_refresh_seq {
                 continue;
@@ -137,8 +221,20 @@ where
             refresh_pending = false;
             match result {
                 Ok(next_items) => {
+                    let pending_ids = post_action_processing
+                        .as_ref()
+                        .map(|processing| processing.ids.clone())
+                        .unwrap_or_default();
+                    let mut next_items = merge_retained_items(&items, &next_items, &pending_ids);
+                    sticky_items
+                        .retain(|sticky| !next_items.iter().any(|item| item.id == sticky.id));
+                    for sticky in &sticky_items {
+                        if !next_items.iter().any(|item| item.id == sticky.id) {
+                            next_items.push(sticky.clone());
+                        }
+                    }
+                    selected = preserve_selected_index(&items, &next_items, selected);
                     items = next_items;
-                    post_action_processing = None;
                     if message
                         .as_deref()
                         .is_some_and(|value| value.starts_with("Error:"))
@@ -147,7 +243,6 @@ where
                     }
                 }
                 Err(err) => {
-                    post_action_processing = None;
                     message = Some(format!("Error: {err}"));
                 }
             }
@@ -165,7 +260,7 @@ where
             &[],
             false,
             message.as_deref(),
-            post_action_processing,
+            post_action_processing.as_ref(),
         )?;
         if let Some(processing) = post_action_processing.as_mut() {
             processing.frame = processing.frame.wrapping_add(1);
@@ -193,24 +288,39 @@ where
                 if items.is_empty() {
                     continue;
                 }
-                let action_was_attach = items[selected].label.starts_with("[ ]");
-                let result = run_with_spinner(title, &items, selected, || activate(selected))?;
-                message = result.starts_with("Error:").then_some(result);
-                if message.is_none() {
-                    if let Some(item) = items.get_mut(selected) {
-                        item.label = optimistic_toggle_label(&item.label, action_was_attach);
+                let item = items[selected].clone();
+                let already_pending = post_action_processing
+                    .as_ref()
+                    .is_some_and(|processing| processing.ids.contains(&item.id));
+                if already_pending {
+                    continue;
+                }
+
+                let queued = QueuedAction {
+                    action_was_attach: item.label.starts_with("[ ]"),
+                    item,
+                };
+                if action_tx.send(queued.clone()).is_ok() {
+                    match post_action_processing.as_mut() {
+                        Some(processing) => processing.ids.push(queued.item.id),
+                        None => {
+                            post_action_processing = Some(ProcessingIndicator {
+                                frame: 0,
+                                ids: vec![queued.item.id],
+                            });
+                        }
                     }
-                    post_action_processing = None;
-                    refresh_seq = refresh_seq.wrapping_add(1);
-                    minimum_refresh_seq = refresh_seq;
-                    refresh_pending = refresh_tx.send(refresh_seq).is_ok();
-                    last_refresh = Instant::now();
                 }
             }
+            event if matches!(list_key_action(&event), Some(ListKeyAction::Background)) => {
+                return Ok(());
+            }
             event if matches!(list_key_action(&event), Some(ListKeyAction::Cancel)) => {
-                message = Some(run_with_spinner(title, &items, selected, || {
+                let (result, next_selected) = run_with_spinner(title, &items, selected, || {
                     exit().map(|()| "Detached attached USB/IP ports".to_string())
-                })?);
+                })?;
+                selected = next_selected;
+                message = Some(result);
                 if !message.as_deref().unwrap_or_default().starts_with("Error:") {
                     return Ok(());
                 }
@@ -320,7 +430,7 @@ fn draw_items(
     chosen: &[usize],
     show_checkboxes: bool,
     message: Option<&str>,
-    processing: Option<ProcessingIndicator>,
+    processing: Option<&ProcessingIndicator>,
 ) -> Result<(), String> {
     let mut out = stdout();
     let (cols, rows) = size().unwrap_or((100, 30));
@@ -366,7 +476,9 @@ fn draw_items(
         } else {
             "[ ] "
         };
-        let is_processing = processing.is_some_and(|processing| processing.index == index);
+        let is_processing = processing
+            .as_ref()
+            .is_some_and(|processing| processing.ids.contains(&item.id));
         let row_color = if is_processing {
             Color::Yellow
         } else if item.label.starts_with("[x]") {
@@ -375,8 +487,8 @@ fn draw_items(
             Color::White
         };
         let row_bg = (selected == index).then_some(Color::DarkGrey);
-        let label = if processing.is_some_and(|processing| processing.index == index) {
-            label_with_spinner(&item.label, processing.unwrap().frame)
+        let label = if is_processing {
+            label_with_spinner(&item.label, processing.as_ref().unwrap().frame)
         } else {
             item.label.clone()
         };
@@ -420,7 +532,7 @@ fn run_with_spinner<Action>(
     items: &[TuiItem],
     selected: usize,
     action: Action,
-) -> Result<String, String>
+) -> Result<(String, usize), String>
 where
     Action: FnOnce() -> Result<String, String> + Send,
 {
@@ -431,17 +543,23 @@ where
         });
 
         let mut frame = 0usize;
+        let mut current_selected = selected;
         loop {
             draw_items(
                 title,
                 items,
-                selected,
+                current_selected,
                 &[],
                 false,
                 None,
-                Some(ProcessingIndicator {
-                    index: selected,
+                Some(&ProcessingIndicator {
                     frame,
+                    ids: vec![
+                        items
+                            .get(selected)
+                            .map(|item| item.id.clone())
+                            .unwrap_or_default(),
+                    ],
                 }),
             )?;
             frame = frame.wrapping_add(1);
@@ -451,24 +569,41 @@ where
             {
                 let event =
                     event::read().map_err(|err| format!("Failed to read terminal event: {err}"))?;
+                if matches!(list_key_action(&event), Some(ListKeyAction::Up)) {
+                    current_selected =
+                        next_index(current_selected, items.len(), SelectionAction::Up);
+                    continue;
+                }
+                if matches!(list_key_action(&event), Some(ListKeyAction::Down)) {
+                    current_selected =
+                        next_index(current_selected, items.len(), SelectionAction::Down);
+                    continue;
+                }
                 if matches!(list_key_action(&event), Some(ListKeyAction::Cancel)) {
-                    return Ok(
+                    return Ok((
                         "Error: Operation is still running; usbip timeout will stop it shortly"
                             .to_string(),
-                    );
+                        current_selected,
+                    ));
                 }
             }
 
             match rx.recv_timeout(Duration::from_millis(120)) {
                 Ok(result) => {
-                    return Ok(match result {
-                        Ok(message) => message,
-                        Err(err) => format!("Error: {err}"),
-                    });
+                    return Ok((
+                        match result {
+                            Ok(message) => message,
+                            Err(err) => format!("Error: {err}"),
+                        },
+                        current_selected,
+                    ));
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    return Ok("Error: worker stopped unexpectedly".into());
+                    return Ok((
+                        "Error: worker stopped unexpectedly".into(),
+                        current_selected,
+                    ));
                 }
             }
         }
@@ -551,7 +686,7 @@ fn draw_status_bar(out: &mut impl Write, width: usize) -> Result<(), String> {
         }),
         SetForegroundColor(Color::White),
         Print(pad_to_width(
-            "  ↑↓/j/k Move  Space Attach/Detach  Esc/Ctrl+C Detach & Quit",
+            "  ↑↓/j/k Move  Space Attach/Detach  Esc Background  Ctrl+C Detach & Quit",
             controls_width
         )),
         ResetColor,
