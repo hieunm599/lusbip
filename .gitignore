@@ -1,0 +1,22 @@
+/target/
+
+# Local editor and OS files
+.DS_Store
+*.swp
+*.swo
+*~
+
+# Agent/local workspace metadata
+.agents/
+.codex/
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+
+# Generated release packages
+/dist/
+*.tar.gz
+*.zip
+*.sha256
