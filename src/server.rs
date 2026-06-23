@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::io::{self, Write};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
@@ -54,6 +55,9 @@ struct ServerDeviceFilter {
 
 impl ServerDeviceFilter {
     fn matches(&self, device: &nusb::DeviceInfo) -> bool {
+        if is_usb_hub(device) {
+            return false;
+        }
         if let Some(expected) = self.vid
             && device.vendor_id() != expected
         {
@@ -72,6 +76,13 @@ impl ServerDeviceFilter {
         }
         true
     }
+}
+
+fn is_usb_hub(device: &nusb::DeviceInfo) -> bool {
+    device.class() == 0x09
+        || device
+            .interfaces()
+            .any(|interface| interface.class() == 0x09)
 }
 
 fn export_bus_id(device: &nusb::DeviceInfo) -> String {
@@ -97,42 +108,57 @@ async fn render_server_status(
     occupancy: OccupancyMap,
 ) {
     let mut interval = tokio::time::interval(Duration::from_millis(1000));
+    let mut last_rendered = String::new();
 
     loop {
         interval.tick().await;
-        let occupancy_snapshot = occupancy.read().await.clone();
-        print!("\x1b[2J\x1b[H");
-        println!("LUSBIP USB/IP server listening on {addr}");
-        println!("Press Ctrl+C to stop and release devices.");
-        println!();
-        println!("Bus ID | VID:PID | Product | Status");
-        println!("------------------------------------");
-
-        let views = match nusb::list_devices().await {
-            Ok(devices) => shared_device_views(&devices.collect::<Vec<_>>(), &filter),
-            Err(err) => {
-                println!("Unable to refresh USB list: {err}");
-                Vec::new()
-            }
-        };
-
-        if views.is_empty() {
-            println!("(no matching USB devices currently plugged in)");
-            continue;
-        }
-
-        for view in &views {
-            let mut row = view.clone();
-            row.client = occupancy_snapshot
-                .get(&row.bus_id)
-                .map(|addr| client_ip_string(addr.ip()));
-            println!("{}", format_shared_device_row(&row));
+        let rendered = build_server_status(addr, &filter, &occupancy).await;
+        if rendered != last_rendered {
+            print!("\x1b[2J\x1b[H{rendered}");
+            let _ = io::stdout().flush();
+            last_rendered = rendered;
         }
     }
 }
 
 fn client_ip_string(ip: IpAddr) -> String {
     ip.to_string()
+}
+
+async fn build_server_status(
+    addr: SocketAddr,
+    filter: &ServerDeviceFilter,
+    occupancy: &OccupancyMap,
+) -> String {
+    let occupancy_snapshot = occupancy.read().await.clone();
+    let mut rendered = String::new();
+    rendered.push_str(&format!("LUSBIP USB/IP server listening on {addr}\n"));
+    rendered.push_str("Press Ctrl+C to stop and release devices.\n\n");
+    rendered.push_str("Bus ID | VID:PID | Product | Status\n");
+    rendered.push_str("------------------------------------\n");
+
+    let views = match nusb::list_devices().await {
+        Ok(devices) => shared_device_views(&devices.collect::<Vec<_>>(), filter),
+        Err(err) => {
+            rendered.push_str(&format!("Unable to refresh USB list: {err}\n"));
+            Vec::new()
+        }
+    };
+
+    if views.is_empty() {
+        rendered.push_str("(no matching USB devices currently plugged in)\n");
+        return rendered;
+    }
+
+    for view in &views {
+        let mut row = view.clone();
+        row.client = occupancy_snapshot
+            .get(&row.bus_id)
+            .map(|addr| client_ip_string(addr.ip()));
+        rendered.push_str(&format!("{}\n", format_shared_device_row(&row)));
+    }
+
+    rendered
 }
 
 async fn sync_server_devices(

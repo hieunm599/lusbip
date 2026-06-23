@@ -1,5 +1,5 @@
 use lusbip::cli::{Cli, Commands};
-use lusbip::client::DoctorReport;
+use lusbip::client::{DoctorReport, ubuntu_client_packages};
 
 #[test]
 fn parses_tui_command_with_remote_defaults() {
@@ -111,8 +111,31 @@ fn parses_doctor_command_with_remote_and_tcp_port() {
     assert!(matches!(
         cli.command,
         Commands::Doctor(args)
-            if args.remote.as_deref() == Some("10.10.61.72") && args.tcp_port == 3241
+            if args.remote.as_deref() == Some("10.10.61.72") && args.tcp_port == 3241 && !args.fix
     ));
+}
+
+#[test]
+fn parses_doctor_fix_command() {
+    let cli = Cli::parse_from(["lusbip", "doctor", "--fix"]);
+
+    assert!(matches!(
+        cli.command,
+        Commands::Doctor(args) if args.fix && args.remote.is_none() && args.tcp_port == 3240
+    ));
+}
+
+#[test]
+fn ubuntu_client_packages_include_kernel_specific_tools_and_modules() {
+    assert_eq!(
+        ubuntu_client_packages("6.8.0-124-generic"),
+        vec![
+            "usbip",
+            "linux-tools-generic",
+            "linux-tools-6.8.0-124-generic",
+            "linux-modules-extra-6.8.0-124-generic"
+        ]
+    );
 }
 
 #[test]

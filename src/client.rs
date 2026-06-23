@@ -1,5 +1,11 @@
 use crate::process::{CommandRunner, StdCommandRunner};
 use crate::tui::{TuiItem, run_action_list, select_one};
+use std::fs;
+use std::io::ErrorKind;
+use std::path::PathBuf;
+
+const VHCI_STATUS_PATH: &str = "/sys/devices/platform/vhci_hcd.0/status";
+const VHCI_DETACH_PATH: &str = "/sys/devices/platform/vhci_hcd.0/detach";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteUsbDevice {
@@ -46,6 +52,7 @@ impl DoctorReport {
 }
 
 pub fn run_attach(remote: &str, tcp_port: u16, bus_id: Option<&str>) -> Result<(), String> {
+    let _session_lock = ClientSessionLock::acquire(remote, tcp_port)?;
     let runner = StdCommandRunner;
     let devices = query_remote_devices(&runner, remote, tcp_port)?;
     let selected = match bus_id {
@@ -90,12 +97,16 @@ pub fn run_detach_interactive() -> Result<(), String> {
 }
 
 pub fn run_remote_control_tui(remote: &str, tcp_port: u16) -> Result<(), String> {
-    let runner = StdCommandRunner;
+    let _session_lock = ClientSessionLock::acquire(remote, tcp_port)?;
     let title = format!("LUSBIP - Remote USB ports ({remote}:{tcp_port})");
+    let load_remote = remote.to_string();
+    let action_remote = remote.to_string();
+    let exit_remote = remote.to_string();
     run_action_list(
         &title,
-        || {
-            let states = load_remote_device_states(&runner, remote, tcp_port)?;
+        move || {
+            let runner = StdCommandRunner;
+            let states = load_remote_device_states(&runner, &load_remote, tcp_port)?;
             Ok(states
                 .iter()
                 .map(|state| TuiItem {
@@ -104,21 +115,25 @@ pub fn run_remote_control_tui(remote: &str, tcp_port: u16) -> Result<(), String>
                 })
                 .collect())
         },
-        |index| {
-            let states = load_remote_device_states(&runner, remote, tcp_port)?;
+        move |index| {
+            let runner = StdCommandRunner;
+            let states = load_remote_device_states(&runner, &action_remote, tcp_port)?;
             let selected = states
                 .get(index)
                 .ok_or_else(|| "Selected USB device is no longer available".to_string())?
                 .clone();
-            toggle_remote_device(&runner, remote, tcp_port, &selected)
+            toggle_remote_device(&runner, &action_remote, tcp_port, &selected)
         },
-        || detach_attached_remote_devices_on_exit(&runner, remote, tcp_port),
+        move || {
+            let runner = StdCommandRunner;
+            detach_attached_remote_devices_on_exit(&runner, &exit_remote, tcp_port)
+        },
     )
 }
 
 pub fn run_status(remote: Option<&str>, tcp_port: u16) -> Result<(), String> {
     let runner = StdCommandRunner;
-    let ports = query_attached_ports(&runner)?;
+    let ports = query_attached_ports_resilient(&runner);
 
     println!("Attached USB/IP ports:");
     if ports.is_empty() {
@@ -151,8 +166,12 @@ pub fn run_status(remote: Option<&str>, tcp_port: u16) -> Result<(), String> {
     Ok(())
 }
 
-pub fn run_doctor(remote: Option<&str>, tcp_port: u16) -> Result<(), String> {
+pub fn run_doctor(remote: Option<&str>, tcp_port: u16, fix: bool) -> Result<(), String> {
     let runner = StdCommandRunner;
+
+    if fix {
+        apply_doctor_fixes(&runner)?;
+    }
 
     let mut report = DoctorReport {
         usbip_available: false,
@@ -237,6 +256,239 @@ fn print_check(name: &str, ok: bool, detail: &str) {
     println!("[{status}] {name}: {detail}");
 }
 
+struct ClientSessionLock {
+    path: PathBuf,
+}
+
+impl ClientSessionLock {
+    fn acquire(remote: &str, tcp_port: u16) -> Result<Self, String> {
+        let path = client_session_lock_path(remote, tcp_port);
+        match fs::create_dir(&path) {
+            Ok(()) => {
+                let pid_path = path.join("pid");
+                if let Err(err) = fs::write(&pid_path, std::process::id().to_string()) {
+                    let _ = fs::remove_dir(&path);
+                    return Err(format!(
+                        "Không ghi được lock file {}: {err}",
+                        pid_path.display()
+                    ));
+                }
+                Ok(Self { path })
+            }
+            Err(err) if err.kind() == ErrorKind::AlreadyExists => {
+                let pid_path = path.join("pid");
+                let pid = fs::read_to_string(&pid_path).ok().and_then(|value| {
+                    value
+                        .trim()
+                        .parse::<u32>()
+                        .ok()
+                        .filter(|pid| process_exists(*pid))
+                });
+
+                if let Some(pid) = pid {
+                    return Err(format!(
+                        "Đang có một phiên lusbip client khác cho {remote}:{tcp_port} (pid {pid}). Hãy đóng phiên đó trước khi mở phiên mới."
+                    ));
+                }
+
+                fs::remove_dir_all(&path).map_err(|remove_err| {
+                    format!(
+                        "Lock cũ {} không còn tiến trình sống nhưng không xóa được: {remove_err}. Hãy xóa lock này rồi chạy lại.",
+                        path.display()
+                    )
+                })?;
+                Self::acquire(remote, tcp_port)
+            }
+            Err(err) => Err(format!("Không tạo được lock {}: {err}", path.display())),
+        }
+    }
+}
+
+impl Drop for ClientSessionLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(self.path.join("pid"));
+        let _ = fs::remove_dir(&self.path);
+    }
+}
+
+fn client_session_lock_path(remote: &str, tcp_port: u16) -> PathBuf {
+    let remote = remote
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    std::env::temp_dir().join(format!("lusbip-client-{remote}-{tcp_port}.lock"))
+}
+
+fn process_exists(pid: u32) -> bool {
+    PathBuf::from("/proc").join(pid.to_string()).exists()
+}
+
+fn apply_doctor_fixes(runner: &impl CommandRunner) -> Result<(), String> {
+    if !cfg!(target_os = "linux") {
+        return Err("doctor --fix currently supports Linux only".into());
+    }
+
+    println!("Applying Linux USB/IP client fixes...");
+    if command_success(runner, "apt-get", &["--version"]) {
+        let kernel = command_stdout(runner, "uname", &["-r"])?;
+        let packages = ubuntu_client_packages(kernel.trim());
+        if !command_success(runner, "usbip", &["version"])
+            || !command_success(runner, "modinfo", &["vhci-hcd"])
+        {
+            run_fix_command(runner, "sudo", &["apt-get", "update"])?;
+            let mut args = vec!["apt-get", "install", "-y"];
+            args.extend(packages.iter().map(String::as_str));
+            run_fix_command(runner, "sudo", &args)?;
+        }
+    } else {
+        println!(
+            "No apt-get found. Please install usbip tools and vhci-hcd kernel module for this distro."
+        );
+    }
+
+    run_fix_command(runner, "sudo", &["modprobe", "vhci-hcd"])?;
+    detach_stale_vhci_ports(runner)?;
+    Ok(())
+}
+
+pub fn ubuntu_client_packages(kernel: &str) -> Vec<String> {
+    vec![
+        "usbip".to_string(),
+        "linux-tools-generic".to_string(),
+        format!("linux-tools-{kernel}"),
+        format!("linux-modules-extra-{kernel}"),
+    ]
+}
+
+fn command_success(runner: &impl CommandRunner, program: &str, args: &[&str]) -> bool {
+    runner
+        .run(program, args)
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
+fn command_stdout(
+    runner: &impl CommandRunner,
+    program: &str,
+    args: &[&str],
+) -> Result<String, String> {
+    let output = runner
+        .run(program, args)
+        .map_err(|err| format!("Failed to execute {program}: {err}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "{program} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn run_fix_command(
+    runner: &impl CommandRunner,
+    program: &str,
+    args: &[&str],
+) -> Result<(), String> {
+    let command = std::iter::once(program)
+        .chain(args.iter().copied())
+        .collect::<Vec<_>>()
+        .join(" ");
+    println!("Running: {command}");
+    let status = runner
+        .run_foreground(program, args)
+        .map_err(|err| format!("Failed to execute {command}: {err}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("{command} failed"))
+    }
+}
+
+fn detach_stale_vhci_ports(runner: &impl CommandRunner) -> Result<(), String> {
+    let ports = stale_vhci_ports();
+
+    if ports.is_empty() {
+        return Ok(());
+    }
+
+    println!(
+        "Found stale VHCI ports: {}. Detaching before reconnecting.",
+        ports.join(", ")
+    );
+    for port in ports {
+        if let Err(err) = run_fix_command(runner, "sudo", &["usbip", "detach", "-p", &port]) {
+            println!("{err}; falling back to direct VHCI detach");
+            run_direct_vhci_detach(runner, &port)?;
+        }
+    }
+    Ok(())
+}
+
+fn detach_stale_vhci_ports_quiet(runner: &impl CommandRunner) -> Result<(), String> {
+    for port in stale_vhci_ports() {
+        if detach_port(runner, &port).is_err() {
+            direct_vhci_detach_quiet(runner, &port)?;
+        }
+    }
+    Ok(())
+}
+
+fn run_direct_vhci_detach(runner: &impl CommandRunner, port: &str) -> Result<(), String> {
+    let port = normalized_vhci_port(port)?;
+    let script = format!("printf '{port}' > {VHCI_DETACH_PATH}");
+    run_fix_command(runner, "sudo", &["sh", "-c", &script])
+}
+
+fn direct_vhci_detach_quiet(runner: &impl CommandRunner, port: &str) -> Result<(), String> {
+    let port = normalized_vhci_port(port)?;
+    let script = format!("printf '{port}' > {VHCI_DETACH_PATH}");
+    let status = runner
+        .run_interactive("sudo", &["-n", "sh", "-c", &script])
+        .map_err(|err| format!("Failed to detach VHCI port {port}: {err}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("Failed to detach VHCI port {port}"))
+    }
+}
+
+fn normalized_vhci_port(port: &str) -> Result<String, String> {
+    port.parse::<u16>()
+        .map(|port| port.to_string())
+        .map_err(|_| format!("Invalid VHCI port {port}"))
+}
+
+fn stale_vhci_ports() -> Vec<String> {
+    std::fs::read_to_string(VHCI_STATUS_PATH)
+        .map(|status| parse_vhci_status_ports(&status))
+        .unwrap_or_default()
+}
+
+pub fn parse_vhci_status_ports(status: &str) -> Vec<String> {
+    status
+        .lines()
+        .filter_map(|line| {
+            let columns = line.split_whitespace().collect::<Vec<_>>();
+            if columns.len() < 6 || columns[0] == "hub" {
+                return None;
+            }
+            let port = columns[1];
+            let state = columns[2];
+            let local_busid = columns[5];
+            if state == "004" || local_busid == "0-0" {
+                return None;
+            }
+            port.parse::<u16>().ok().map(|port| format!("{port:02}"))
+        })
+        .collect()
+}
+
 pub fn query_remote_devices(
     runner: &impl CommandRunner,
     remote: &str,
@@ -265,9 +517,9 @@ pub fn query_attached_ports(runner: &impl CommandRunner) -> Result<Vec<AttachedU
         .map_err(|err| format!("Failed to execute usbip port: {err}"))?;
 
     if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!(
-            "usbip port failed: {}",
-            String::from_utf8_lossy(&output.stderr)
+            "usbip port failed: {stderr}\nRun `lusbip doctor --fix` to reload vhci-hcd and detach stale USB/IP ports."
         ));
     }
 
@@ -280,22 +532,36 @@ pub fn auto_detach_matching_ports(
     runner: &impl CommandRunner,
     target: &AttachTarget,
 ) -> Result<(), String> {
-    let ports = query_attached_ports(runner)?;
+    let ports = query_attached_ports_resilient(runner);
     for port in ports_to_detach(&ports, target) {
         detach_port(runner, &port)?;
     }
     Ok(())
 }
 
+fn query_attached_ports_resilient(runner: &impl CommandRunner) -> Vec<AttachedUsbPort> {
+    match query_attached_ports(runner) {
+        Ok(ports) => ports,
+        Err(_) => {
+            let _ = detach_stale_vhci_ports_quiet(runner);
+            query_attached_ports(runner).unwrap_or_default()
+        }
+    }
+}
+
 pub fn detach_port(runner: &impl CommandRunner, port: &str) -> Result<(), String> {
-    let status = runner
-        .run_interactive("sudo", &["-n", "usbip", "detach", "-p", port])
+    let output = runner
+        .run("sudo", &["-n", "usbip", "detach", "-p", port])
         .map_err(|err| format!("Failed to execute usbip detach for port {port}: {err}"))?;
 
-    if status.success() {
+    if output.status.success() {
         Ok(())
     } else {
-        Err(format!("Failed to detach USB/IP port {port}"))
+        Err(format!(
+            "Failed to detach USB/IP port {port}: {}{}",
+            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&output.stdout)
+        ))
     }
 }
 
@@ -306,8 +572,8 @@ pub fn attach_remote_device(
     bus_id: &str,
 ) -> Result<(), String> {
     let tcp_port = tcp_port.to_string();
-    let status = runner
-        .run_interactive(
+    let output = runner
+        .run(
             "sudo",
             &[
                 "-n",
@@ -323,10 +589,14 @@ pub fn attach_remote_device(
         )
         .map_err(|err| format!("Failed to execute usbip attach: {err}"))?;
 
-    if status.success() {
+    if output.status.success() {
         Ok(())
     } else {
-        Err("usbip attach failed".into())
+        Err(format!(
+            "usbip attach failed: {}{}",
+            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&output.stdout)
+        ))
     }
 }
 
@@ -391,8 +661,18 @@ fn load_remote_device_states(
     tcp_port: u16,
 ) -> Result<Vec<RemoteUsbDeviceState>, String> {
     let devices = query_remote_devices(runner, remote, tcp_port)?;
-    let ports = query_attached_ports(runner)?;
-    Ok(remote_device_states(remote, &devices, &ports))
+    let ports = query_attached_ports_resilient(runner);
+    let stale_ports = ports_to_detach_for_missing_remote_devices(remote, &devices, &ports);
+
+    for port in &stale_ports {
+        let _ = detach_port(runner, port);
+    }
+
+    let current_ports = ports
+        .into_iter()
+        .filter(|port| !stale_ports.contains(&port.port))
+        .collect::<Vec<_>>();
+    Ok(remote_device_states(remote, &devices, &current_ports))
 }
 
 fn toggle_remote_device(
@@ -488,7 +768,7 @@ pub fn format_remote_device_state(state: &RemoteUsbDeviceState) -> String {
         .attached_port
         .as_deref()
         .map(|port| format!("[x] port {port}"))
-        .unwrap_or_else(|| "[ ] detached".to_string());
+        .unwrap_or_else(|| "[ ]".to_string());
 
     format!(
         "{status} | {} | {}",
@@ -608,6 +888,23 @@ pub fn ports_to_detach(ports: &[AttachedUsbPort], target: &AttachTarget) -> Vec<
         .collect()
 }
 
+pub fn ports_to_detach_for_missing_remote_devices(
+    remote: &str,
+    devices: &[RemoteUsbDevice],
+    ports: &[AttachedUsbPort],
+) -> Vec<String> {
+    ports
+        .iter()
+        .filter(|port| port.remote_host.as_deref() == Some(remote))
+        .filter(|port| {
+            port.remote_bus_id
+                .as_deref()
+                .is_none_or(|bus_id| !devices.iter().any(|device| device.bus_id == bus_id))
+        })
+        .map(|port| port.port.clone())
+        .collect()
+}
+
 fn should_detach(port: &AttachedUsbPort, target: &AttachTarget) -> bool {
     let bus_matches = target
         .bus_id
@@ -660,5 +957,28 @@ fn extract_usbip_url(line: &str) -> Option<(String, String)> {
         None
     } else {
         Some((host.to_string(), bus_id.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::client_session_lock_path;
+
+    #[test]
+    fn client_session_lock_path_is_shared_by_remote_and_port() {
+        let path = client_session_lock_path("10.10.61.72", 3240);
+        assert_eq!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some("lusbip-client-10.10.61.72-3240.lock")
+        );
+    }
+
+    #[test]
+    fn client_session_lock_path_sanitizes_unsafe_remote_chars() {
+        let path = client_session_lock_path("fe80::1%eth0", 3240);
+        assert_eq!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some("lusbip-client-fe80__1_eth0-3240.lock")
+        );
     }
 }

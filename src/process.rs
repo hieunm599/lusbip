@@ -9,6 +9,7 @@ const CHILD_POLL_INTERVAL: Duration = Duration::from_millis(50);
 pub trait CommandRunner {
     fn run(&self, program: &str, args: &[&str]) -> std::io::Result<Output>;
     fn run_interactive(&self, program: &str, args: &[&str]) -> std::io::Result<ExitStatus>;
+    fn run_foreground(&self, program: &str, args: &[&str]) -> std::io::Result<ExitStatus>;
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -69,5 +70,14 @@ impl CommandRunner for StdCommandRunner {
             }
             thread::sleep(CHILD_POLL_INTERVAL);
         }
+    }
+
+    fn run_foreground(&self, program: &str, args: &[&str]) -> std::io::Result<ExitStatus> {
+        std::process::Command::new(program)
+            .args(args)
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status()
     }
 }

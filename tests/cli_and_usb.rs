@@ -4,7 +4,7 @@ use lusbip::client::{AttachedUsbPort, format_attached_port};
 use lusbip::server::{SharedDeviceView, format_shared_device_row};
 use lusbip::tui::{
     ListKeyAction, SelectionAction, label_with_spinner, list_key_action, next_index,
-    should_flush_startup_event, spinner_frame, truncate_to_width,
+    optimistic_toggle_label, should_flush_startup_event, spinner_frame, truncate_to_width,
 };
 use lusbip::usb::{UsbDeviceSummary, matches_filter};
 
@@ -71,8 +71,20 @@ fn tui_spinner_frames_rotate_and_append_to_row_label() {
     assert_eq!(spinner_frame(3), "\\");
     assert_eq!(spinner_frame(4), "|");
     assert_eq!(
-        label_with_spinner("[ ] detached | 5-1 | CP2102", 1),
-        "[ ] detached | 5-1 | CP2102  /"
+        label_with_spinner("[ ] | 5-1 | CP2102", 1),
+        "[ ] | 5-1 | CP2102  /"
+    );
+}
+
+#[test]
+fn tui_optimistically_updates_label_after_toggle_success() {
+    assert_eq!(
+        optimistic_toggle_label("[ ] | 5-1 | CP2102", true),
+        "[x] | 5-1 | CP2102"
+    );
+    assert_eq!(
+        optimistic_toggle_label("[x] port 00 | 5-1 | CP2102", false),
+        "[ ] | 5-1 | CP2102"
     );
 }
 

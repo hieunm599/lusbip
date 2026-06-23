@@ -1,7 +1,7 @@
 use std::io::{Write, stdout};
 use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::{
     cursor::{Hide, MoveTo, Show},
@@ -105,16 +105,54 @@ pub fn run_action_list<LoadItems, Activate, Exit>(
     mut exit: Exit,
 ) -> Result<(), String>
 where
-    LoadItems: FnMut() -> Result<Vec<TuiItem>, String>,
+    LoadItems: FnMut() -> Result<Vec<TuiItem>, String> + Send + 'static,
     Activate: FnMut(usize) -> Result<String, String> + Send,
     Exit: FnMut() -> Result<(), String> + Send,
 {
     let mut terminal = TerminalGuard::enter()?;
     let mut selected = 0usize;
     let mut message: Option<String> = None;
+    let mut items = load_items()?;
+    let mut last_refresh = Instant::now();
+    let mut refresh_pending = false;
+    let mut refresh_seq = 0u64;
+    let mut minimum_refresh_seq = 0u64;
+    let mut post_action_processing: Option<ProcessingIndicator> = None;
+    let (refresh_tx, refresh_rx) = mpsc::channel::<u64>();
+    let (items_tx, items_rx) = mpsc::channel::<(u64, Result<Vec<TuiItem>, String>)>();
+
+    thread::spawn(move || {
+        while let Ok(seq) = refresh_rx.recv() {
+            if items_tx.send((seq, load_items())).is_err() {
+                break;
+            }
+        }
+    });
 
     loop {
-        let items = load_items()?;
+        while let Ok((seq, result)) = items_rx.try_recv() {
+            if seq < minimum_refresh_seq {
+                continue;
+            }
+            refresh_pending = false;
+            match result {
+                Ok(next_items) => {
+                    items = next_items;
+                    post_action_processing = None;
+                    if message
+                        .as_deref()
+                        .is_some_and(|value| value.starts_with("Error:"))
+                    {
+                        message = None;
+                    }
+                }
+                Err(err) => {
+                    post_action_processing = None;
+                    message = Some(format!("Error: {err}"));
+                }
+            }
+        }
+
         if !items.is_empty() {
             selected = selected.min(items.len() - 1);
         } else {
@@ -127,11 +165,20 @@ where
             &[],
             false,
             message.as_deref(),
-            None,
+            post_action_processing,
         )?;
-        if !event::poll(Duration::from_millis(1000))
+        if let Some(processing) = post_action_processing.as_mut() {
+            processing.frame = processing.frame.wrapping_add(1);
+        }
+
+        if !event::poll(Duration::from_millis(50))
             .map_err(|err| format!("Failed to poll terminal event: {err}"))?
         {
+            if last_refresh.elapsed() >= Duration::from_millis(1000) && !refresh_pending {
+                refresh_seq = refresh_seq.wrapping_add(1);
+                refresh_pending = refresh_tx.send(refresh_seq).is_ok();
+                last_refresh = Instant::now();
+            }
             continue;
         }
 
@@ -146,8 +193,19 @@ where
                 if items.is_empty() {
                     continue;
                 }
+                let action_was_attach = items[selected].label.starts_with("[ ]");
                 let result = run_with_spinner(title, &items, selected, || activate(selected))?;
                 message = result.starts_with("Error:").then_some(result);
+                if message.is_none() {
+                    if let Some(item) = items.get_mut(selected) {
+                        item.label = optimistic_toggle_label(&item.label, action_was_attach);
+                    }
+                    post_action_processing = None;
+                    refresh_seq = refresh_seq.wrapping_add(1);
+                    minimum_refresh_seq = refresh_seq;
+                    refresh_pending = refresh_tx.send(refresh_seq).is_ok();
+                    last_refresh = Instant::now();
+                }
             }
             event if matches!(list_key_action(&event), Some(ListKeyAction::Cancel)) => {
                 message = Some(run_with_spinner(title, &items, selected, || {
@@ -194,6 +252,25 @@ pub fn select_one(title: &str, items: &[TuiItem], _help: &str) -> Result<usize, 
         }
         terminal.touch();
     }
+}
+
+pub fn optimistic_toggle_label(label: &str, action_was_attach: bool) -> String {
+    if action_was_attach {
+        return label
+            .strip_prefix("[ ]")
+            .map(|rest| format!("[x]{rest}"))
+            .unwrap_or_else(|| label.to_string());
+    }
+
+    if let Some(rest) = label.strip_prefix("[x] port ") {
+        let rest = rest.split_once(" | ").map(|(_, rest)| rest).unwrap_or(rest);
+        return format!("[ ] | {rest}");
+    }
+
+    label
+        .strip_prefix("[x]")
+        .map(|rest| format!("[ ]{rest}"))
+        .unwrap_or_else(|| label.to_string())
 }
 
 pub fn select_many(title: &str, items: &[TuiItem], _help: &str) -> Result<Vec<usize>, String> {
@@ -294,10 +371,8 @@ fn draw_items(
             Color::Yellow
         } else if item.label.starts_with("[x]") {
             Color::Green
-        } else if selected == index {
-            Color::White
         } else {
-            Color::Grey
+            Color::White
         };
         let row_bg = (selected == index).then_some(Color::DarkGrey);
         let label = if processing.is_some_and(|processing| processing.index == index) {

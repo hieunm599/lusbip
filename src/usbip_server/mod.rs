@@ -11,6 +11,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{ErrorKind, Result};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
@@ -237,7 +238,10 @@ impl UsbIpServer {
     {
         match nusb::list_devices().await {
             Ok(list) => {
-                let devs: Vec<DeviceInfo> = list.filter(filter).collect();
+                let devs: Vec<DeviceInfo> = list
+                    .filter(|device| !is_usb_hub_info(device))
+                    .filter(filter)
+                    .collect();
                 // info!("devices: {devs:?}");
                 Self {
                     available_devices: RwLock::new(Self::with_nusb_devices(devs).await),
@@ -258,6 +262,7 @@ impl UsbIpServer {
     {
         let current_infos = nusb::list_devices()
             .await?
+            .filter(|device| !is_usb_hub_info(device))
             .filter(|device| filter(device))
             .collect::<Vec<_>>();
         let current_bus_ids = current_infos
@@ -325,10 +330,16 @@ impl UsbIpServer {
 
     pub async fn occupy(&self, bus_id: &str) -> Result<UsbDevice> {
         let mut ad = self.available_devices.write().await;
-        let device = match ad.iter().position(|d| d.bus_id == bus_id) {
+        let mut device = match ad.iter().position(|d| d.bus_id == bus_id) {
             Some(i) => ad.remove(i),
             None => return Err(std::io::Error::other(format!("No available device"))),
         };
+        drop(ad);
+
+        if let Some(reopened_device) = reset_and_reopen_host_device(&device).await {
+            device = reopened_device;
+        }
+
         let mut ud = self.used_devices.write().await;
         if !ud.iter().any(|d| d.bus_id == device.bus_id) {
             ud.push(device.clone());
@@ -462,7 +473,14 @@ impl UsbIpServer {
                         )
                     }
                     Err(err) => {
-                        warn!("Error handling URB: {err}");
+                        warn!(
+                            "Error handling URB: {err}; real_ep=0x{real_ep:02x} attr={} dir={} transfer_len={} setup={:?} data_len={}",
+                            ep.attributes,
+                            if out { "out" } else { "in" },
+                            transfer_buffer_length,
+                            SetupPacket::parse(&setup),
+                            data.len()
+                        );
                         let actual_length = match ep.direction() {
                             Direction::In => 0,
                             Direction::Out => transfer_buffer_length,
@@ -517,6 +535,45 @@ fn host_export_bus_id(device_info: &DeviceInfo) -> String {
     {
         device_info.bus_id().to_string()
     }
+}
+
+fn is_usb_hub_info(device_info: &DeviceInfo) -> bool {
+    device_info.class() == 0x09
+        || device_info
+            .interfaces()
+            .any(|interface| interface.class() == 0x09)
+}
+
+async fn reset_and_reopen_host_device(device: &UsbDevice) -> Option<UsbDevice> {
+    let bus_id = device.bus_id.clone();
+    if let Some(handle) = device.device_handler.clone() {
+        if let Err(err) = handle.reset().await {
+            warn!("USB device {bus_id} reset returned an error, attempting reopen anyway: {err}");
+        }
+        tokio::time::sleep(Duration::from_millis(3000)).await;
+    }
+
+    let serial = device
+        .string_pool
+        .get(&device.string_serial)
+        .map(String::as_str);
+    let device_info = match nusb::list_devices().await.ok()?.find(|info| {
+        host_export_bus_id(info) == bus_id
+            || (info.vendor_id() == device.vendor_id
+                && info.product_id() == device.product_id
+                && serial.is_none_or(|serial| info.serial_number() == Some(serial)))
+    }) {
+        Some(info) => info,
+        None => {
+            warn!("Unable to find USB device {bus_id} after reset");
+            return None;
+        }
+    };
+
+    UsbIpServer::with_nusb_devices(vec![device_info])
+        .await
+        .into_iter()
+        .next()
 }
 
 pub async fn handler<T: AsyncReadExt + AsyncWriteExt + Unpin>(

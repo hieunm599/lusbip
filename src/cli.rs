@@ -26,7 +26,7 @@ pub enum Commands {
     Attach(AttachArgs),
     Detach(DetachArgs),
     Status(StatusArgs),
-    Doctor(StatusArgs),
+    Doctor(DoctorArgs),
     Tui(TuiArgs),
 }
 
@@ -66,6 +66,16 @@ pub struct StatusArgs {
     pub remote: Option<String>,
     #[arg(long, default_value_t = 3240)]
     pub tcp_port: u16,
+}
+
+#[derive(Debug, Args)]
+pub struct DoctorArgs {
+    #[arg(short, long)]
+    pub remote: Option<String>,
+    #[arg(long, default_value_t = 3240)]
+    pub tcp_port: u16,
+    #[arg(long)]
+    pub fix: bool,
 }
 
 #[derive(Debug, Args)]

@@ -393,7 +393,20 @@ pub fn handle_urb_for_interface(
                 ((transfer_buffer_length - 1) as usize / max_packet_size + 1) * max_packet_size;
             let buffer = Buffer::new(requested_len);
             let c = ep_in.transfer_blocking(buffer, timeout);
-            let buf = c.into_result()?;
+            let buf = match c.into_result() {
+                Ok(buf) => buf,
+                Err(err) => {
+                    warn!(
+                        "Bulk IN transfer failed on ep 0x{:02x}: {err}; clearing halt and retrying once",
+                        ep.address
+                    );
+                    ep_in.clear_halt().wait()?;
+                    let retry_buffer = Buffer::new(requested_len);
+                    ep_in
+                        .transfer_blocking(retry_buffer, timeout)
+                        .into_result()?
+                }
+            };
             return Ok(buf.into_vec());
             // let mut reader = ep_in
             //     .reader(4096)
@@ -416,14 +429,20 @@ pub fn handle_urb_for_interface(
             // }
         } else {
             // bulk out
-            let mut writer = interface
-                .endpoint::<Bulk, Out>(ep.address)?
-                .writer(4096)
-                .with_num_transfers(1)
-                .with_write_timeout(timeout);
-            // info!("Writing bulk out buffer {req:02x?}, ep: {ep:02x?}");
-            writer.write_all(&req)?;
-            writer.flush()?;
+            let mut ep_out = interface.endpoint::<Bulk, Out>(ep.address)?;
+            let buffer = Buffer::from(req);
+            let completion = ep_out.transfer_blocking(buffer, timeout);
+            if let Err(err) = completion.into_result() {
+                warn!(
+                    "Bulk OUT transfer failed on ep 0x{:02x}: {err}; clearing halt and retrying once",
+                    ep.address
+                );
+                ep_out.clear_halt().wait()?;
+                let retry_buffer = Buffer::from(req);
+                ep_out
+                    .transfer_blocking(retry_buffer, timeout)
+                    .into_result()?;
+            }
             // handle.write_bulk(ep.address, req, timeout).ok();
         }
     } else {

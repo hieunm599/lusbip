@@ -23,6 +23,14 @@ Trên client cần kernel module VHCI:
 sudo modprobe vhci-hcd
 ```
 
+Nếu không chắc máy client đã đủ môi trường, chạy:
+
+```bash
+lusbip doctor --fix
+```
+
+Trên Ubuntu/Debian, lệnh này sẽ cố gắng cài USB/IP userspace tools, kernel module extra tương ứng với kernel hiện tại, rồi nạp `vhci-hcd`.
+
 Trên Ubuntu/Debian, gói thường cần cài là:
 
 ```bash
@@ -150,6 +158,7 @@ sudo lusbip server --vid 10c4 --pid ea60 --host 0.0.0.0 --port 3240
 Trên máy client:
 
 ```bash
+lusbip doctor --fix
 sudo -v
 lusbip client --remote 10.10.61.72 --tcp-port 3240
 ```
@@ -199,6 +208,12 @@ Kiểm tra môi trường:
 lusbip doctor --remote 10.10.61.72 --tcp-port 3240
 ```
 
+Tự sửa các lỗi môi trường phổ biến trên Linux client:
+
+```bash
+lusbip doctor --fix
+```
+
 ## Lab Mặc Định
 
 Lab đang dùng trong repo:
@@ -216,6 +231,7 @@ sudo ~/bin/lusbip server --host 0.0.0.0 --port 3240
 Client:
 
 ```bash
+~/.local/bin/lusbip doctor --fix
 sudo -v
 ~/.local/bin/lusbip client --remote 10.10.61.72 --tcp-port 3240
 ```

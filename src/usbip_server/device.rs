@@ -23,6 +23,12 @@ impl From<u16> for Version {
     }
 }
 
+impl Version {
+    fn bcd_bytes(&self) -> (u8, u8) {
+        ((self.minor << 4) | self.patch, self.major)
+    }
+}
+
 /// Represent a USB device
 #[derive(Clone, Default, Debug)]
 #[cfg_attr(feature = "serde", derive(Serialize))]
@@ -112,6 +118,80 @@ impl UsbDevice {
             .flatten();
         self.string_configuration = 0;
         old
+    }
+
+    fn is_superspeed(&self) -> bool {
+        self.speed >= UsbSpeed::Super as u32
+    }
+
+    fn ep0_descriptor_size(&self) -> u8 {
+        if self.is_superspeed() {
+            9
+        } else {
+            self.ep0_in.max_packet_size as u8
+        }
+    }
+
+    fn bos_descriptor(&self) -> Vec<u8> {
+        if !self.is_superspeed() {
+            return vec![0x05, DescriptorType::BOS as u8, 0x05, 0x00, 0x00];
+        }
+
+        let mut desc = vec![
+            0x05,
+            DescriptorType::BOS as u8,
+            0x16,
+            0x00,
+            0x02,
+            0x07,
+            DescriptorType::DeviceCapability as u8,
+            0x02,
+            0x02,
+            0x00,
+            0x00,
+            0x00,
+            0x0A,
+            DescriptorType::DeviceCapability as u8,
+            0x03,
+            0x00,
+            0x0E,
+            0x00,
+            0x01,
+            0x0A,
+            0xFF,
+            0x07,
+        ];
+        let len = desc.len() as u16;
+        desc[2] = len as u8;
+        desc[3] = (len >> 8) as u8;
+        desc
+    }
+
+    fn should_forward_set_configuration(&self, requested_configuration: u8) -> bool {
+        requested_configuration != self.configuration_value
+    }
+
+    fn handles_mass_storage_get_max_lun(&self, setup_packet: SetupPacket) -> bool {
+        setup_packet.request_type == 0xA1
+            && setup_packet.request == 0xFE
+            && setup_packet.value == 0
+            && setup_packet.length == 1
+            && self
+                .interfaces
+                .get((setup_packet.index & 0xFF) as usize)
+                .is_some_and(|intf| {
+                    is_mass_storage_bulk_only_interface(
+                        intf.interface_class,
+                        intf.interface_subclass,
+                        intf.interface_protocol,
+                    )
+                })
+    }
+
+    fn handles_superspeed_virtual_request(&self, setup_packet: SetupPacket) -> bool {
+        self.is_superspeed()
+            && setup_packet.request_type == 0x00
+            && (setup_packet.request == 0x30 || setup_packet.request == 0x31)
     }
 
     /// Returns the old value, if present.
@@ -311,22 +391,24 @@ impl UsbDevice {
                         match FromPrimitive::from_u16(setup_packet.value >> 8) {
                             Some(Device) => {
                                 debug!("Get device descriptor");
+                                let (usb_lo, usb_hi) = self.usb_version.bcd_bytes();
+                                let (device_lo, device_hi) = self.device_bcd.bcd_bytes();
                                 // Standard Device Descriptor
                                 let mut desc = vec![
                                     0x12,         // bLength
                                     Device as u8, // bDescriptorType: Device
-                                    self.usb_version.minor,
-                                    self.usb_version.major, // bcdUSB: USB 2.0
-                                    self.device_class,      // bDeviceClass
-                                    self.device_subclass,   // bDeviceSubClass
-                                    self.device_protocol,   // bDeviceProtocol
-                                    self.ep0_in.max_packet_size as u8, // bMaxPacketSize0
-                                    self.vendor_id as u8,   // idVendor
+                                    usb_lo,
+                                    usb_hi,                     // bcdUSB
+                                    self.device_class,          // bDeviceClass
+                                    self.device_subclass,       // bDeviceSubClass
+                                    self.device_protocol,       // bDeviceProtocol
+                                    self.ep0_descriptor_size(), // bMaxPacketSize0
+                                    self.vendor_id as u8,       // idVendor
                                     (self.vendor_id >> 8) as u8,
                                     self.product_id as u8, // idProduct
                                     (self.product_id >> 8) as u8,
-                                    self.device_bcd.minor, // bcdDevice
-                                    self.device_bcd.major,
+                                    device_lo, // bcdDevice
+                                    device_hi,
                                     self.string_manufacturer, // iManufacturer
                                     self.string_product,      // iProduct
                                     self.string_serial,       // iSerial
@@ -341,12 +423,7 @@ impl UsbDevice {
                             }
                             Some(BOS) => {
                                 debug!("Get BOS descriptor");
-                                let mut desc = vec![
-                                    0x05,      // bLength
-                                    BOS as u8, // bDescriptorType: BOS
-                                    0x05, 0x00, // wTotalLength
-                                    0x00, // bNumCapabilities
-                                ];
+                                let mut desc = self.bos_descriptor();
 
                                 // requested len too short: wLength < real length
                                 if setup_packet.length < desc.len() as u16 {
@@ -395,6 +472,11 @@ impl UsbDevice {
                                             endpoint.interval,                     // bInterval
                                         ];
                                         intf_desc.append(&mut ep_desc);
+                                        if self.is_superspeed() {
+                                            let mut ss_companion =
+                                                superspeed_endpoint_companion_descriptor(endpoint);
+                                            intf_desc.append(&mut ss_companion);
+                                        }
                                     }
                                     desc.append(&mut intf_desc);
                                 }
@@ -452,18 +534,19 @@ impl UsbDevice {
                             }
                             Some(DeviceQualifier) => {
                                 debug!("Get device qualifier descriptor");
+                                let (usb_lo, usb_hi) = self.usb_version.bcd_bytes();
                                 // Device_Qualifier Descriptor
                                 let mut desc = vec![
                                     0x0A,                  // bLength
                                     DeviceQualifier as u8, // bDescriptorType: Device Qualifier
-                                    self.usb_version.minor,
-                                    self.usb_version.major, // bcdUSB
-                                    self.device_class,      // bDeviceClass
-                                    self.device_subclass,   // bDeviceSUbClass
-                                    self.device_protocol,   // bDeviceProtocol
-                                    self.ep0_in.max_packet_size as u8, // bMaxPacketSize0
-                                    self.num_configurations, // bNumConfigurations
-                                    0x00,                   // bReserved
+                                    usb_lo,
+                                    usb_hi,                     // bcdUSB
+                                    self.device_class,          // bDeviceClass
+                                    self.device_subclass,       // bDeviceSUbClass
+                                    self.device_protocol,       // bDeviceProtocol
+                                    self.ep0_descriptor_size(), // bMaxPacketSize0
+                                    self.num_configurations,    // bNumConfigurations
+                                    0x00,                       // bReserved
                                 ];
 
                                 // requested len too short: wLength < real length
@@ -477,6 +560,10 @@ impl UsbDevice {
                                 Ok(vec![])
                             }
                         }
+                    }
+                    _ if self.handles_mass_storage_get_max_lun(setup_packet) => {
+                        debug!("Get max LUN");
+                        Ok(vec![0])
                     }
                     _ if setup_packet.request_type & 0xF == 1 => {
                         // to interface
@@ -540,17 +627,23 @@ impl UsbDevice {
                                     }
                                 }
                             }
-                            if let Err(e) =
-                                device.set_configuration(setup_packet.value as u8).wait()
-                            {
-                                error!("Error setting config: {e:?}");
-                            };
+                            if self.should_forward_set_configuration(setup_packet.value as u8) {
+                                if let Err(e) =
+                                    device.set_configuration(setup_packet.value as u8).wait()
+                                {
+                                    error!("Error setting config: {e:?}");
+                                };
+                            }
                         }
                         // requested len too short: wLength < real length
                         if setup_packet.length < desc.len() as u16 {
                             desc.resize(setup_packet.length as usize, 0);
                         }
                         Ok(desc)
+                    }
+                    _ if self.handles_superspeed_virtual_request(setup_packet) => {
+                        debug!("Ack SuperSpeed virtual request");
+                        Ok(Vec::new())
                     }
                     _ if setup_packet.request_type & 0xF == 1 => {
                         // to interface
@@ -629,6 +722,26 @@ impl UsbDevice {
     }
 }
 
+fn is_mass_storage_bulk_only_interface(class: u8, subclass: u8, protocol: u8) -> bool {
+    class == 0x08 && subclass == 0x06 && protocol == 0x50
+}
+
+fn superspeed_endpoint_companion_descriptor(endpoint: &UsbEndpoint) -> Vec<u8> {
+    let bytes_per_interval = if endpoint.attributes == EndpointAttributes::Interrupt as u8 {
+        endpoint.max_packet_size
+    } else {
+        0
+    };
+    vec![
+        0x06,
+        DescriptorType::SuperspeedUsbEndpointCompanion as u8,
+        0x00,
+        0x00,
+        bytes_per_interval as u8,
+        (bytes_per_interval >> 8) as u8,
+    ]
+}
+
 /// A handler for URB targeting the device
 pub trait UsbDeviceHandler: std::fmt::Debug {
     /// Handle a URB(USB Request Block) targeting at this device
@@ -680,5 +793,48 @@ pub fn release_claim(device: Device) {
         // ignore alternate settings
         let intf_num = intf.interface_number();
         let _ = device.attach_kernel_driver(intf_num);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn set_configuration_is_not_forwarded_when_already_active() {
+        let mut device = UsbDevice::new(1);
+        device.configuration_value = 1;
+
+        assert!(!device.should_forward_set_configuration(1));
+        assert!(device.should_forward_set_configuration(0));
+        assert!(device.should_forward_set_configuration(2));
+    }
+
+    #[test]
+    fn identifies_mass_storage_bulk_only_interface() {
+        assert!(is_mass_storage_bulk_only_interface(0x08, 0x06, 0x50));
+        assert!(!is_mass_storage_bulk_only_interface(0x08, 0x06, 0x62));
+        assert!(!is_mass_storage_bulk_only_interface(0xFF, 0x00, 0x00));
+    }
+
+    #[test]
+    fn superspeed_virtual_requests_are_handled_locally() {
+        let mut device = UsbDevice::new(1);
+        device.speed = UsbSpeed::Super as u32;
+
+        assert!(device.handles_superspeed_virtual_request(SetupPacket {
+            request_type: 0x00,
+            request: 0x30,
+            value: 0,
+            index: 0,
+            length: 6,
+        }));
+        assert!(device.handles_superspeed_virtual_request(SetupPacket {
+            request_type: 0x00,
+            request: 0x31,
+            value: 0x28,
+            index: 0,
+            length: 0,
+        }));
     }
 }

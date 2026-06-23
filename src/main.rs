@@ -23,7 +23,9 @@ async fn main() {
         }
         Commands::Detach(args) => lusbip::client::run_detach(&args.port),
         Commands::Status(args) => lusbip::client::run_status(args.remote.as_deref(), args.tcp_port),
-        Commands::Doctor(args) => lusbip::client::run_doctor(args.remote.as_deref(), args.tcp_port),
+        Commands::Doctor(args) => {
+            lusbip::client::run_doctor(args.remote.as_deref(), args.tcp_port, args.fix)
+        }
         Commands::Tui(args) => lusbip::app_tui::run(args.remote.as_deref(), args.tcp_port).await,
     };
 
