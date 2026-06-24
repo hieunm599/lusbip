@@ -373,7 +373,7 @@ checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 
 [[package]]
 name = "lusbip"
-version = "1.0.9"
+version = "1.0.5"
 dependencies = [
  "clap",
  "crossterm",
