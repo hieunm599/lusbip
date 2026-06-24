@@ -565,6 +565,17 @@ impl UsbDevice {
                         debug!("Get max LUN");
                         Ok(vec![0])
                     }
+                    _ if self.should_forward_control_to_device(setup_packet)
+                        && self.device_handler.is_some() =>
+                    {
+                        let handler = self.device_handler.clone().unwrap();
+                        handle_urb_for_device(
+                            handler,
+                            transfer_buffer_length,
+                            setup_packet,
+                            out_data,
+                        )
+                    }
                     _ if setup_packet.request_type & 0xF == 1 => {
                         // to interface
                         // see https://www.beyondlogic.org/usbnutshell/usb6.shtml
@@ -584,6 +595,7 @@ impl UsbDevice {
                             transfer_buffer_length,
                             setup_packet,
                             out_data,
+                            self.uses_low_latency_bulk_in(),
                         )
                     }
                     _ if setup_packet.request_type & 0xF == 0 && self.device_handler.is_some() => {
@@ -645,6 +657,17 @@ impl UsbDevice {
                         debug!("Ack SuperSpeed virtual request");
                         Ok(Vec::new())
                     }
+                    _ if self.should_forward_control_to_device(setup_packet)
+                        && self.device_handler.is_some() =>
+                    {
+                        let handler = self.device_handler.clone().unwrap();
+                        handle_urb_for_device(
+                            handler,
+                            transfer_buffer_length,
+                            setup_packet,
+                            out_data,
+                        )
+                    }
                     _ if setup_packet.request_type & 0xF == 1 => {
                         // to interface
                         // see https://www.beyondlogic.org/usbnutshell/usb6.shtml
@@ -665,6 +688,7 @@ impl UsbDevice {
                             transfer_buffer_length,
                             setup_packet,
                             out_data,
+                            self.uses_low_latency_bulk_in(),
                         )
                     }
                     _ if setup_packet.request_type & 0xF == 0 => {
@@ -716,9 +740,24 @@ impl UsbDevice {
                     transfer_buffer_length,
                     setup_packet,
                     out_data,
+                    self.uses_low_latency_bulk_in(),
                 )
             } // _ => unimplemented!("transfer to {:?}", ep),
         }
+    }
+}
+
+impl UsbDevice {
+    fn uses_low_latency_bulk_in(&self) -> bool {
+        self.vendor_id == 0x10c4 && self.product_id == 0xea60
+    }
+
+    fn should_forward_control_to_device(&self, setup: SetupPacket) -> bool {
+        let is_vendor_request = setup.request_type & 0x60 == 0x40;
+        let is_interface_recipient = setup.request_type & 0x1f == 0x01;
+        let is_cp210x = self.vendor_id == 0x10c4 && self.product_id == 0xea60;
+
+        is_cp210x && is_vendor_request && is_interface_recipient
     }
 }
 
@@ -815,6 +854,39 @@ mod tests {
         assert!(is_mass_storage_bulk_only_interface(0x08, 0x06, 0x50));
         assert!(!is_mass_storage_bulk_only_interface(0x08, 0x06, 0x62));
         assert!(!is_mass_storage_bulk_only_interface(0xFF, 0x00, 0x00));
+    }
+
+    #[test]
+    fn cp210x_vendor_interface_control_requests_use_device_handle() {
+        let mut device = UsbDevice::new(1);
+        device.vendor_id = 0x10c4;
+        device.product_id = 0xea60;
+
+        assert!(device.uses_low_latency_bulk_in());
+        assert!(device.should_forward_control_to_device(SetupPacket {
+            request_type: 0x41,
+            request: 0x00,
+            value: 1,
+            index: 0,
+            length: 0,
+        }));
+        assert!(device.should_forward_control_to_device(SetupPacket {
+            request_type: 0xc1,
+            request: 0x00,
+            value: 0,
+            index: 0,
+            length: 2,
+        }));
+
+        device.product_id = 0x1234;
+        assert!(!device.uses_low_latency_bulk_in());
+        assert!(!device.should_forward_control_to_device(SetupPacket {
+            request_type: 0x41,
+            request: 0x00,
+            value: 1,
+            index: 0,
+            length: 0,
+        }));
     }
 
     #[test]

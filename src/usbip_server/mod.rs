@@ -738,6 +738,9 @@ pub async fn server(addr: SocketAddr, server: Arc<UsbIpServer>) {
     let listener = TcpListener::bind(addr).await.expect("bind to addr");
 
     while let Ok((mut socket, _addr)) = listener.accept().await {
+        if let Err(err) = socket.set_nodelay(true) {
+            warn!("Unable to enable TCP_NODELAY for USB/IP client: {err}");
+        }
         info!("Got connection from {:?}", socket.peer_addr());
         let new_server = server.clone();
         tokio::spawn(async move {
@@ -768,6 +771,9 @@ pub async fn server_with_occupancy_listener(
     occupancy: OccupancyMap,
 ) {
     while let Ok((mut socket, _addr)) = listener.accept().await {
+        if let Err(err) = socket.set_nodelay(true) {
+            warn!("Unable to enable TCP_NODELAY for USB/IP client: {err}");
+        }
         let peer_addr = match socket.peer_addr() {
             Ok(addr) => addr,
             Err(err) => {

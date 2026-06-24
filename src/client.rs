@@ -5,6 +5,7 @@ use std::fs;
 use std::io::{ErrorKind, Read};
 use std::net::TcpStream;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 const VHCI_STATUS_PATH: &str = "/sys/devices/platform/vhci_hcd.0/status";
@@ -106,12 +107,19 @@ pub fn run_remote_control_tui(remote: &str, tcp_port: u16) -> Result<(), String>
     let load_remote = remote.to_string();
     let action_remote = remote.to_string();
     let exit_remote = remote.to_string();
+    let cached_devices = Arc::new(Mutex::new(Vec::<RemoteUsbDevice>::new()));
+    let load_cache = cached_devices.clone();
+    let action_cache = cached_devices.clone();
     run_action_list(
         &title,
         move || {
             let runner = StdCommandRunner;
-            let states = load_remote_device_states(&runner, &load_remote, tcp_port)
-                .map_err(|err| friendly_client_error(&err, &load_remote, tcp_port))?;
+            let mut cache = load_cache
+                .lock()
+                .map_err(|_| "Remote USB device cache lock poisoned".to_string())?;
+            let states =
+                load_remote_device_states_cached(&runner, &load_remote, tcp_port, &mut cache)
+                    .map_err(|err| friendly_client_error(&err, &load_remote, tcp_port))?;
             Ok(states
                 .iter()
                 .map(|state| TuiItem {
@@ -122,8 +130,12 @@ pub fn run_remote_control_tui(remote: &str, tcp_port: u16) -> Result<(), String>
         },
         move |item| {
             let runner = StdCommandRunner;
-            let states = load_remote_device_states(&runner, &action_remote, tcp_port)
-                .map_err(|err| friendly_client_error(&err, &action_remote, tcp_port))?;
+            let mut cache = action_cache
+                .lock()
+                .map_err(|_| "Remote USB device cache lock poisoned".to_string())?;
+            let states =
+                load_remote_device_states_cached(&runner, &action_remote, tcp_port, &mut cache)
+                    .map_err(|err| friendly_client_error(&err, &action_remote, tcp_port))?;
             let selected = states
                 .iter()
                 .find(|state| state.device.bus_id == item.id)
@@ -672,6 +684,29 @@ fn load_remote_device_states(
     let ports = query_attached_ports_resilient(runner);
     let occupancy = query_remote_occupancy(remote, tcp_port).unwrap_or_default();
     let mut states = remote_device_states(remote, &devices, &ports);
+    apply_remote_occupancy(&mut states, &occupancy);
+    Ok(states)
+}
+
+fn load_remote_device_states_cached(
+    runner: &impl CommandRunner,
+    remote: &str,
+    tcp_port: u16,
+    cached_devices: &mut Vec<RemoteUsbDevice>,
+) -> Result<Vec<RemoteUsbDeviceState>, String> {
+    let ports = query_attached_ports_resilient(runner);
+    let cached_states = remote_device_states(remote, cached_devices, &ports);
+
+    if cached_devices.is_empty()
+        || !cached_states
+            .iter()
+            .any(|state| state.attached_port.is_some())
+    {
+        *cached_devices = query_remote_devices(runner, remote, tcp_port)?;
+    }
+
+    let occupancy = query_remote_occupancy(remote, tcp_port).unwrap_or_default();
+    let mut states = remote_device_states(remote, cached_devices, &ports);
     apply_remote_occupancy(&mut states, &occupancy);
     Ok(states)
 }

@@ -2,7 +2,7 @@
 use log::*;
 use nusb::{
     Device, Interface, MaybeFuture,
-    transfer::{Buffer, Bulk, Direction, In, Interrupt, Out},
+    transfer::{Buffer, Bulk, Direction, In, Interrupt, Out, TransferError},
 };
 use std::io::Result;
 use std::io::{Read, Write};
@@ -189,6 +189,7 @@ pub fn handle_urb_for_interface(
     transfer_buffer_length: u32,
     setup: SetupPacket,
     req: &[u8],
+    low_latency_bulk_in: bool,
 ) -> Result<Vec<u8>> {
     let timeout = Duration::new(1, 0);
     // info!(
@@ -388,23 +389,34 @@ pub fn handle_urb_for_interface(
             //     .unwrap();
             let mut ep_in = interface.endpoint::<Bulk, In>(ep.address)?;
             let max_packet_size = ep_in.max_packet_size();
+            let bulk_in_timeout = if low_latency_bulk_in {
+                Duration::from_millis(20)
+            } else {
+                timeout
+            };
 
             let requested_len =
                 ((transfer_buffer_length - 1) as usize / max_packet_size + 1) * max_packet_size;
             let buffer = Buffer::new(requested_len);
-            let c = ep_in.transfer_blocking(buffer, timeout);
+            let c = ep_in.transfer_blocking(buffer, bulk_in_timeout);
             let buf = match c.into_result() {
                 Ok(buf) => buf,
-                Err(err) => {
+                Err(TransferError::Cancelled) if low_latency_bulk_in => {
+                    return Ok(Vec::new());
+                }
+                Err(TransferError::Stall) => {
                     warn!(
-                        "Bulk IN transfer failed on ep 0x{:02x}: {err}; clearing halt and retrying once",
+                        "Bulk IN endpoint stalled on ep 0x{:02x}; clearing halt and retrying once",
                         ep.address
                     );
                     ep_in.clear_halt().wait()?;
                     let retry_buffer = Buffer::new(requested_len);
                     ep_in
-                        .transfer_blocking(retry_buffer, timeout)
+                        .transfer_blocking(retry_buffer, bulk_in_timeout)
                         .into_result()?
+                }
+                Err(err) => {
+                    return Err(err.into());
                 }
             };
             return Ok(buf.into_vec());
