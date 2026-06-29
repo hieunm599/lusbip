@@ -45,6 +45,11 @@ Trên máy client:
 lusbip doctor --remote 10.10.61.72 --tcp-port 3240 --fix
 usbip port
 usbip --tcp-port 3240 list -r 10.10.61.72
+```
+
+Kết nối bằng UI:
+
+```bash
 lusbip client --remote 10.10.61.72 --tcp-port 3240
 ```
 
@@ -54,6 +59,13 @@ Trong UI client:
 - `Space`: attach dòng `[ ]`, detach dòng `[x]`.
 - `Esc`: thoát UI và giữ USB/IP port đang attached.
 - `Ctrl+C`: detach các USB/IP port trong màn hiện tại rồi thoát.
+
+Kết nối trực tiếp bằng CLI nếu đã biết bus id từ `usbip list -r`:
+
+```bash
+sudo -v
+lusbip attach --remote 10.10.61.72 --tcp-port 3240 --bus-id 5-1
+```
 
 Sau khi attach, kiểm tra:
 
