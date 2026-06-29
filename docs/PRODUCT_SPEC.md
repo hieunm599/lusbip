@@ -33,7 +33,7 @@ lusbip client --remote <IP> [--tcp-port <PORT>]
 lusbip attach --remote <IP> [--bus-id <BUS_ID>] [--tcp-port <PORT>]
 lusbip detach --port <PORT>
 lusbip status [--remote <IP>] [--tcp-port <PORT>]
-lusbip doctor [--remote <IP>] [--tcp-port <PORT>]
+lusbip doctor [--remote <IP>] [--tcp-port <PORT>] [--fix]
 lusbip tui [--remote <IP>] [--tcp-port <PORT>]
 ```
 
@@ -62,6 +62,7 @@ Mặc định:
 - `detach --port <PORT>` chạy `sudo usbip detach -p <PORT>` để gỡ thủ công một USB/IP port.
 - `status` hiển thị USB/IP port đang attach và thiết bị remote export nếu có `--remote`.
 - `doctor` kiểm tra `usbip`, sudo cache, attached ports, và remote export để chuẩn bị E2E.
+- `doctor --fix` tự chuẩn bị Linux client khi có thể: cài USB/IP tools trên Ubuntu/Debian, nạp `vhci-hcd`, và cleanup stale VHCI ports liên quan.
 
 ## Lỗi Cần Rõ Ràng
 

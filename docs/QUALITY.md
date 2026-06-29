@@ -59,12 +59,12 @@ Trên Ubuntu:
 ssh hieunm@10.10.60.208
 uname -a
 usbip version
-lusbip doctor --remote 10.10.61.72 --tcp-port 3241
-sudo modprobe vhci-hcd
+lusbip doctor --remote 10.10.61.72 --tcp-port 3241 --fix
 ```
 
 Nếu `usbip` hoặc kernel module `vhci-hcd` chưa có, báo lỗi rõ và ghi lại bước cài đặt cần thiết thay vì claim E2E pass.
 Nếu `lusbip doctor` báo `sudo cached` fail, chạy `sudo -v` trong cùng terminal/TTY sẽ chạy `lusbip attach` hoặc `lusbip detach`. Với agent hoặc CI dùng TTY riêng, cache `sudo` từ terminal khác có thể không áp dụng.
+Nếu binary đang chạy không nhận `--fix`, kiểm tra `which lusbip`, `lusbip --version`, và cài lại binary mới trước khi tiếp tục E2E.
 
 ### Pre-clean Trên Ubuntu Client
 

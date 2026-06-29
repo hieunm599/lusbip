@@ -1,46 +1,78 @@
 # lusbip
 
-`lusbip` là CLI Rust giúp chia sẻ và kết nối thiết bị USB qua mạng LAN bằng USB/IP trên Linux.
+`lusbip` là CLI Rust để chia sẻ thiết bị USB qua LAN bằng USB/IP trên Linux.
 
-Mục tiêu hiện tại:
+Mô hình chạy:
 
-- Máy server quảng bá/export các thiết bị USB cục bộ qua USB/IP.
-- Máy client hiển thị danh sách cổng USB remote trong terminal UI.
-- Client dùng phím di chuyển và `Space` để attach/detach.
-- Server và client tự refresh khi cắm/rút thiết bị USB.
+- **Server**: máy Linux đang cắm USB thật, ví dụ Nano Pi.
+- **Client**: máy Linux muốn dùng USB remote, ví dụ Ubuntu dev machine.
 
-## Yêu Cầu
+Lab mặc định trong repo:
 
-Trên cả server và client:
+| Vai trò | Máy |
+| --- | --- |
+| Server | Nano Pi `10.10.61.72` |
+| Client | Ubuntu `10.10.60.208` |
+| Thiết bị | CP2102, thường là `10c4:ea60` |
+
+## Chạy Nhanh Trong Lab
+
+### Server
+
+Trên máy đang cắm USB:
+
+```bash
+lsusb
+sudo lusbip server --host 0.0.0.0 --port 3240
+```
+
+Nếu chỉ muốn export CP2102:
+
+```bash
+sudo lusbip server --vid 10c4 --pid ea60 --host 0.0.0.0 --port 3240
+```
+
+Trong màn server:
+
+- `Esc`: đưa server xuống background nếu chưa có client attached.
+- `Ctrl+C`: dừng server và release thiết bị.
+
+### Client
+
+Trên máy client:
+
+```bash
+lusbip doctor --remote 10.10.61.72 --tcp-port 3240 --fix
+usbip port
+usbip --tcp-port 3240 list -r 10.10.61.72
+lusbip client --remote 10.10.61.72 --tcp-port 3240
+```
+
+Trong UI client:
+
+- `Up/Down` hoặc `j/k`: di chuyển.
+- `Space`: attach dòng `[ ]`, detach dòng `[x]`.
+- `Esc`: thoát UI và giữ USB/IP port đang attached.
+- `Ctrl+C`: detach các USB/IP port trong màn hiện tại rồi thoát.
+
+Sau khi attach, kiểm tra:
+
+```bash
+lsusb
+usbip port
+lusbip status --remote 10.10.61.72 --tcp-port 3240
+```
+
+## Cài Đặt Và Chuẩn Bị
+
+Yêu cầu chung:
 
 - Linux.
+- `lusbip`.
 - `usbip` userspace tools.
-- Quyền `sudo` cho thao tác attach/detach.
+- Quyền `sudo` cho server/attach/detach.
 
-Trên client cần kernel module VHCI:
-
-```bash
-sudo modprobe vhci-hcd
-```
-
-Nếu không chắc máy client đã đủ môi trường, chạy:
-
-```bash
-lusbip doctor --fix
-```
-
-Trên Ubuntu/Debian, lệnh này sẽ cố gắng cài USB/IP userspace tools, kernel module extra tương ứng với kernel hiện tại, rồi nạp `vhci-hcd`.
-
-Trên Ubuntu/Debian, gói thường cần cài là:
-
-```bash
-sudo apt update
-sudo apt install linux-tools-generic linux-tools-$(uname -r)
-```
-
-## Cài Đặt
-
-Cài từ Cargo:
+Cài `lusbip` từ Cargo:
 
 ```bash
 cargo install lusbip
@@ -51,137 +83,29 @@ Hoặc build từ source:
 ```bash
 cargo build --release
 install -Dm755 target/release/lusbip ~/.local/bin/lusbip
-```
-
-### Cài Trên Nano Pi
-
-Nano Pi thường chạy ARM64/aarch64 và có vài điểm khác Ubuntu desktop.
-
-Kiểm tra kiến trúc trước:
-
-```bash
-uname -m
-```
-
-Nếu kết quả là `aarch64`, có thể dùng một trong hai cách dưới.
-
-#### Cách 1: Cài bằng Cargo trên Nano Pi
-
-Cài Rust/Cargo nếu máy chưa có:
-
-```bash
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-. "$HOME/.cargo/env"
-```
-
-Cài `lusbip`:
-
-```bash
-cargo install lusbip
-```
-
-Đảm bảo binary nằm trong PATH:
-
-```bash
-echo 'export PATH="$HOME/.cargo/bin:$PATH"' >> ~/.profile
-. ~/.profile
 lusbip --version
+lusbip doctor --help
 ```
 
-Nếu `cargo install` chậm hoặc hết RAM trên Nano Pi, dùng binary release ở cách 2.
+`lusbip doctor --help` phải có option `--fix`. Nếu không có, máy đang chạy binary cũ trong `PATH`; kiểm tra `which lusbip` rồi cài lại binary mới.
 
-#### Cách 2: Dùng Binary Release Cho ARM64
-
-Tải artifact `lusbip-aarch64-unknown-linux-musl-<version>.tar.gz` từ GitHub Release, rồi cài vào `~/bin`:
-
-```bash
-mkdir -p ~/bin
-tar -xzf lusbip-aarch64-unknown-linux-musl-<version>.tar.gz
-install -m 755 lusbip-aarch64-unknown-linux-musl-<version>/lusbip ~/bin/lusbip
-echo 'export PATH="$HOME/bin:$PATH"' >> ~/.profile
-. ~/.profile
-lusbip --version
-```
-
-#### Chuẩn Bị USB/IP Trên Nano Pi
-
-Nano Pi chạy vai trò server nên cần thấy thiết bị USB local và có quyền truy cập USB:
-
-```bash
-lsusb
-which usbip || true
-```
-
-Nếu thiếu `usbip`, cài gói tương ứng với distro đang chạy. Trên Debian/Ubuntu/Armbian thường thử:
-
-```bash
-sudo apt update
-sudo apt install usbip linux-tools-generic linux-tools-$(uname -r)
-```
-
-Một số image ARM không có đủ `linux-tools-$(uname -r)` trong apt repo. Khi đó cần cài gói `usbip` riêng nếu distro cung cấp, hoặc dùng package kernel/tools đúng với image của board.
-
-Chạy server:
-
-```bash
-sudo ~/bin/lusbip server --host 0.0.0.0 --port 3240
-```
-
-Trong màn server:
-
-- `Esc`: chuyển server sang process nền.
-- `Ctrl+C`: dừng server và release thiết bị.
-
-Server vẫn mở được khi chưa cắm CP2102. Khi cắm CP2102 sau, danh sách sẽ tự cập nhật trong khoảng 1 giây.
-
-Các lỗi thường gặp trên Nano Pi:
-
-- `lusbip: command not found`: `~/bin` hoặc `~/.cargo/bin` chưa nằm trong `PATH`.
-- `usbip: command not found`: thiếu USB/IP userspace tools.
-- Không thấy CP2102 trong server: kiểm tra `lsusb` trước; nếu `lsusb` không thấy thì lỗi nằm ở cổng USB/nguồn/cáp/kernel, không phải `lusbip`.
-- `Permission denied` hoặc không claim được interface: chạy server bằng `sudo`.
-- Port `3240` bị giữ: đổi port, ví dụ `--port 3241`, và client cũng dùng `--tcp-port 3241`.
-
-## Chạy Server
-
-Trên máy đang cắm thiết bị USB, ví dụ Nano Pi:
-
-```bash
-sudo lusbip server --host 0.0.0.0 --port 3240
-```
-
-Server vẫn mở kể cả khi chưa có thiết bị USB nào được cắm. Khi cắm thiết bị sau, danh sách export sẽ tự cập nhật.
-
-Giới hạn theo VID/PID nếu cần:
-
-```bash
-sudo lusbip server --vid 10c4 --pid ea60 --host 0.0.0.0 --port 3240
-```
-
-## Chạy Client UI
-
-Trên máy client:
+Thông thường chỉ cần để `lusbip` tự chuẩn bị client:
 
 ```bash
 lusbip doctor --fix
-sudo -v
-lusbip client --remote 10.10.61.72 --tcp-port 3240
 ```
 
-Phím trong UI:
+Nếu cần làm thủ công trên Ubuntu/Debian client:
 
-- `↑/↓` hoặc `j/k`: di chuyển.
-- `Space`: attach/detach thiết bị đang chọn.
-- `Esc`: thoát màn UI, giữ các USB/IP port đang attached chạy nền.
-- `Ctrl+C`: detach các port đang attached trong màn hiện tại rồi thoát.
+```bash
+sudo apt update
+sudo apt install usbip linux-tools-generic linux-tools-$(uname -r) linux-modules-extra-$(uname -r)
+sudo modprobe vhci-hcd
+```
 
-Trạng thái:
+Với Nano Pi/ARM64, có thể dùng `cargo install lusbip` nếu máy đủ tài nguyên, hoặc dùng release artifact `aarch64-unknown-linux-musl`.
 
-- `[ ]`: thiết bị remote chưa attach.
-- `[x]`: thiết bị remote đang attached trên client.
-- Spinner cuối dòng: attach/detach đang xử lý.
-
-## Lệnh Hữu Ích
+## Lệnh Thường Dùng
 
 Liệt kê USB local:
 
@@ -189,12 +113,14 @@ Liệt kê USB local:
 lusbip list
 ```
 
-Attach trực tiếp một bus id:
+Attach trực tiếp nếu đã biết remote bus id:
 
 ```bash
 sudo -v
 lusbip attach --remote 10.10.61.72 --tcp-port 3240 --bus-id 5-1
 ```
+
+Nếu không truyền `--bus-id`, `lusbip attach` sẽ mở UI chọn thiết bị.
 
 Detach thủ công một USB/IP port:
 
@@ -202,63 +128,47 @@ Detach thủ công một USB/IP port:
 lusbip detach --port 00
 ```
 
-Xem trạng thái:
+Kiểm tra và tự chuẩn bị môi trường client:
 
 ```bash
+lusbip doctor --remote 10.10.61.72 --tcp-port 3240 --fix
 lusbip status --remote 10.10.61.72 --tcp-port 3240
 ```
 
-Kiểm tra môi trường:
+Nếu server dùng port khác, ví dụ `3241`, truyền cùng port cho client:
 
 ```bash
-lusbip doctor --remote 10.10.61.72 --tcp-port 3240
+lusbip client --remote 10.10.61.72 --tcp-port 3241
 ```
 
-Tự sửa các lỗi môi trường phổ biến trên Linux client:
+## Lưu Ý Khi Attach
+
+Trước khi attach, `lusbip` sẽ tự detach stale USB/IP port liên quan tới remote/bus id/VID:PID hiện tại.
+
+CLI không detach bừa các port không xác định được là liên quan. Nếu cần cleanup thủ công, xem port trước rồi chỉ detach đúng port cần gỡ:
 
 ```bash
-lusbip doctor --fix
+usbip port
+lusbip detach --port 00
 ```
 
-## Lab Mặc Định
+## Lỗi Thường Gặp
 
-Lab đang dùng trong repo:
-
-- Server: Nano Pi `10.10.61.72`.
-- Client: Ubuntu `10.10.60.208`.
-- Thiết bị: CP2102, thường là `10c4:ea60`.
-
-Server:
-
-```bash
-sudo ~/bin/lusbip server --host 0.0.0.0 --port 3240
-```
-
-Client:
-
-```bash
-~/.local/bin/lusbip doctor --fix
-sudo -v
-~/.local/bin/lusbip client --remote 10.10.61.72 --tcp-port 3240
-```
-
-## Release
-
-GitHub Actions sẽ build release khi push tag dạng `v*`:
-
-```bash
-git tag v0.1.0
-git push origin v0.1.0
-```
-
-Artifacts hiện tại:
-
-- `x86_64-unknown-linux-gnu`
-- `aarch64-unknown-linux-musl`
+| Lỗi | Cách xử lý |
+| --- | --- |
+| `lusbip: command not found` | Kiểm tra `PATH` hoặc cài lại binary. |
+| `usbip: command not found` | Cài `usbip` userspace tools. |
+| `open vhci_driver (is vhci_hcd loaded?)` | Chạy `sudo modprobe vhci-hcd`; nếu vẫn fail, cài `linux-modules-extra-$(uname -r)`. |
+| `sudo cached` fail trong `doctor` | Chạy `sudo -v` trong cùng terminal trước khi attach/detach. |
+| Client không thấy remote device | Kiểm tra server, firewall/LAN, port, và `usbip --tcp-port <PORT> list -r <REMOTE>`. |
+| Server không thấy thiết bị | Chạy `lsusb` trên server; nếu `lsusb` không thấy thì vấn đề nằm ở USB/cáp/nguồn/kernel. |
+| Server permission denied hoặc không claim được interface | Chạy server bằng `sudo`. |
+| Port `3240` bị giữ | Đổi port server, ví dụ `3241`, rồi truyền cùng port cho client. |
+| `unexpected argument '--fix'` | Binary đang chạy là bản cũ; kiểm tra `which lusbip`, `lusbip --version`, rồi cài lại binary mới. |
 
 ## Giới Hạn Hiện Tại
 
-- Tập trung Linux host/client.
+- Chỉ tập trung Linux host/client.
 - Chưa hỗ trợ discovery tự động qua mDNS.
 - Chưa hỗ trợ Windows/macOS như target chính.
-- USB/IP vẫn phụ thuộc khả năng kernel/driver của thiết bị thật.
+- USB/IP vẫn phụ thuộc driver/kernel của thiết bị thật.
