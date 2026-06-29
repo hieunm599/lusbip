@@ -99,7 +99,7 @@ Nếu cần làm thủ công trên Ubuntu/Debian client:
 
 ```bash
 sudo apt update
-sudo apt install usbip linux-tools-generic linux-tools-$(uname -r) linux-modules-extra-$(uname -r)
+sudo apt install linux-tools-generic linux-tools-$(uname -r) linux-modules-extra-$(uname -r)
 sudo modprobe vhci-hcd
 ```
 

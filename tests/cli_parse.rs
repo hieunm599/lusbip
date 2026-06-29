@@ -140,7 +140,6 @@ fn ubuntu_client_packages_include_kernel_specific_tools_and_modules() {
     assert_eq!(
         ubuntu_client_packages("6.8.0-124-generic"),
         vec![
-            "usbip",
             "linux-tools-generic",
             "linux-tools-6.8.0-124-generic",
             "linux-modules-extra-6.8.0-124-generic"

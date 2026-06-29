@@ -379,7 +379,6 @@ fn apply_doctor_fixes(runner: &impl CommandRunner) -> Result<(), String> {
 
 pub fn ubuntu_client_packages(kernel: &str) -> Vec<String> {
     vec![
-        "usbip".to_string(),
         "linux-tools-generic".to_string(),
         format!("linux-tools-{kernel}"),
         format!("linux-modules-extra-{kernel}"),
