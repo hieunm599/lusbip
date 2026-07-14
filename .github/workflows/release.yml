@@ -14,7 +14,7 @@ env:
 jobs:
   build:
     name: Build ${{ matrix.target }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
@@ -22,9 +22,18 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             asset_name: lusbip-x86_64-unknown-linux-gnu
             rustflags: ""
+            os: ubuntu-latest
+            bin_name: lusbip
           - target: aarch64-unknown-linux-musl
             asset_name: lusbip-aarch64-unknown-linux-musl
             rustflags: "-C linker=rust-lld"
+            os: ubuntu-latest
+            bin_name: lusbip
+          - target: x86_64-pc-windows-msvc
+            asset_name: lusbip-x86_64-pc-windows-msvc
+            rustflags: ""
+            os: windows-latest
+            bin_name: lusbip.exe
 
     steps:
       - name: Checkout
@@ -48,13 +57,16 @@ jobs:
         run: cargo build --locked --release --target ${{ matrix.target }}
 
       - name: Package
+        shell: bash
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
           package="${{ matrix.asset_name }}-${version}"
           mkdir -p "dist/${package}"
-          cp "target/${{ matrix.target }}/release/lusbip" "dist/${package}/lusbip"
-          chmod +x "dist/${package}/lusbip"
+          cp "target/${{ matrix.target }}/release/${{ matrix.bin_name }}" "dist/${package}/${{ matrix.bin_name }}"
+          if [ "${{ matrix.os }}" != "windows-latest" ]; then
+            chmod +x "dist/${package}/${{ matrix.bin_name }}"
+          fi
           cp README.md "dist/${package}/README.md" 2>/dev/null || true
           cp THIRD_PARTY.md "dist/${package}/THIRD_PARTY.md"
           tar -C dist -czf "dist/${package}.tar.gz" "${package}"

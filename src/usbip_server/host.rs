@@ -484,6 +484,7 @@ impl NusbUsbHostDeviceHandler {
 }
 
 impl UsbDeviceHandler for NusbUsbHostDeviceHandler {
+    #[cfg(not(target_os = "windows"))]
     fn handle_urb(
         &mut self,
         _transfer_buffer_length: u32,
@@ -495,62 +496,67 @@ impl UsbDeviceHandler for NusbUsbHostDeviceHandler {
         let timeout = std::time::Duration::new(1, 0);
         let handle = self.handle.lock().unwrap();
         // control
-        if cfg!(not(target_os = "windows")) {
-            if setup.request_type & 0x80 == 0 {
-                // control out
-                #[cfg(not(target_os = "windows"))]
-                let control = nusb::transfer::ControlOut {
-                    control_type: match (setup.request_type >> 5) & 0b11 {
-                        0 => nusb::transfer::ControlType::Standard,
-                        1 => nusb::transfer::ControlType::Class,
-                        2 => nusb::transfer::ControlType::Vendor,
-                        _ => unimplemented!(),
-                    },
-                    recipient: match setup.request_type & 0b11111 {
-                        0 => nusb::transfer::Recipient::Device,
-                        1 => nusb::transfer::Recipient::Interface,
-                        2 => nusb::transfer::Recipient::Endpoint,
-                        3 => nusb::transfer::Recipient::Other,
-                        _ => unimplemented!(),
-                    },
-                    request: setup.request,
-                    value: setup.value,
-                    index: setup.index,
-                    data: req,
-                };
-                #[cfg(not(target_os = "windows"))]
-                handle.control_out(control, timeout).wait()?;
-            } else {
-                // control in
-                #[cfg(not(target_os = "windows"))]
-                let control = nusb::transfer::ControlIn {
-                    control_type: match (setup.request_type >> 5) & 0b11 {
-                        0 => nusb::transfer::ControlType::Standard,
-                        1 => nusb::transfer::ControlType::Class,
-                        2 => nusb::transfer::ControlType::Vendor,
-                        _ => unimplemented!(),
-                    },
-                    recipient: match setup.request_type & 0b11111 {
-                        0 => nusb::transfer::Recipient::Device,
-                        1 => nusb::transfer::Recipient::Interface,
-                        2 => nusb::transfer::Recipient::Endpoint,
-                        3 => nusb::transfer::Recipient::Other,
-                        _ => unimplemented!(),
-                    },
-                    request: setup.request,
-                    value: setup.value,
-                    index: setup.index,
-                    length: setup.length,
-                };
-                #[cfg(not(target_os = "windows"))]
-                if let Ok(buf) = handle.control_in(control, timeout).wait() {
-                    return Ok(buf);
-                }
-            }
+        if setup.request_type & 0x80 == 0 {
+            // control out
+            let control = nusb::transfer::ControlOut {
+                control_type: match (setup.request_type >> 5) & 0b11 {
+                    0 => nusb::transfer::ControlType::Standard,
+                    1 => nusb::transfer::ControlType::Class,
+                    2 => nusb::transfer::ControlType::Vendor,
+                    _ => unimplemented!(),
+                },
+                recipient: match setup.request_type & 0b11111 {
+                    0 => nusb::transfer::Recipient::Device,
+                    1 => nusb::transfer::Recipient::Interface,
+                    2 => nusb::transfer::Recipient::Endpoint,
+                    3 => nusb::transfer::Recipient::Other,
+                    _ => unimplemented!(),
+                },
+                request: setup.request,
+                value: setup.value,
+                index: setup.index,
+                data: req,
+            };
+            handle.control_out(control, timeout).wait()?;
         } else {
-            warn!("Not supported in windows")
+            // control in
+            let control = nusb::transfer::ControlIn {
+                control_type: match (setup.request_type >> 5) & 0b11 {
+                    0 => nusb::transfer::ControlType::Standard,
+                    1 => nusb::transfer::ControlType::Class,
+                    2 => nusb::transfer::ControlType::Vendor,
+                    _ => unimplemented!(),
+                },
+                recipient: match setup.request_type & 0b11111 {
+                    0 => nusb::transfer::Recipient::Device,
+                    1 => nusb::transfer::Recipient::Interface,
+                    2 => nusb::transfer::Recipient::Endpoint,
+                    3 => nusb::transfer::Recipient::Other,
+                    _ => unimplemented!(),
+                },
+                request: setup.request,
+                value: setup.value,
+                index: setup.index,
+                length: setup.length,
+            };
+            if let Ok(buf) = handle.control_in(control, timeout).wait() {
+                return Ok(buf);
+            }
         }
         Ok(vec![])
+    }
+
+    #[cfg(target_os = "windows")]
+    fn handle_urb(
+        &mut self,
+        _transfer_buffer_length: u32,
+        _setup: SetupPacket,
+        _req: &[u8],
+    ) -> Result<Vec<u8>> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "Not supported on Windows",
+        ))
     }
 
     #[cfg(target_os = "linux")]
@@ -570,7 +576,6 @@ impl UsbDeviceHandler for NusbUsbHostDeviceHandler {
         }
     }
 
-    #[cfg(not(target_os = "windows"))]
     fn reset(&mut self) -> Result<()> {
         let mut dev = self.handle.lock().unwrap();
         let vid = dev.device_descriptor().vendor_id();
@@ -598,7 +603,6 @@ impl UsbDeviceHandler for NusbUsbHostDeviceHandler {
         Ok(())
     }
 
-    #[cfg(not(target_os = "windows"))]
     fn set_configuration(&self, setup: &[u8; 8]) -> Result<()> {
         let dev = self.handle.lock().unwrap();
         let sp = SetupPacket::parse(setup);
@@ -632,6 +636,7 @@ impl UsbDeviceHandler for NusbUsbHostDeviceHandler {
 
 pub fn handle_urb_for_device(
     device: Device,
+    interface: Option<nusb::Interface>,
     _transfer_buffer_length: u32,
     setup: SetupPacket,
     req: &[u8],
@@ -639,8 +644,10 @@ pub fn handle_urb_for_device(
     // info!("To host device: setup={setup:?} req={req:?}");
     // let mut buffer = vec![0u8; transfer_buffer_length as usize];
     let timeout = std::time::Duration::new(1, 0);
-    // control
-    if cfg!(not(target_os = "windows")) {
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = interface;
         let control_type = match (setup.request_type >> 5) & 0b11 {
             0 => nusb::transfer::ControlType::Standard,
             1 => nusb::transfer::ControlType::Class,
@@ -656,7 +663,6 @@ pub fn handle_urb_for_device(
         };
         if setup.request_type & 0x80 == 0 {
             // control out
-            #[cfg(not(target_os = "windows"))]
             let control = nusb::transfer::ControlOut {
                 control_type,
                 recipient,
@@ -665,11 +671,9 @@ pub fn handle_urb_for_device(
                 index: setup.index,
                 data: req,
             };
-            #[cfg(not(target_os = "windows"))]
             device.control_out(control, timeout).wait()?;
         } else {
             // control in
-            #[cfg(not(target_os = "windows"))]
             let control = nusb::transfer::ControlIn {
                 control_type,
                 recipient,
@@ -678,13 +682,61 @@ pub fn handle_urb_for_device(
                 index: setup.index,
                 length: setup.length,
             };
-            #[cfg(not(target_os = "windows"))]
             if let Ok(buf) = device.control_in(control, timeout).wait() {
                 return Ok(buf);
             }
         }
-    } else {
-        warn!("Not supported in windows")
+        Ok(vec![])
     }
-    Ok(vec![])
+
+    #[cfg(target_os = "windows")]
+    {
+        let _ = device;
+        let control_type = match (setup.request_type >> 5) & 0b11 {
+            0 => nusb::transfer::ControlType::Standard,
+            1 => nusb::transfer::ControlType::Class,
+            2 => nusb::transfer::ControlType::Vendor,
+            _ => unimplemented!(),
+        };
+        let recipient = match setup.request_type & 0b11111 {
+            0 => nusb::transfer::Recipient::Device,
+            1 => nusb::transfer::Recipient::Interface,
+            2 => nusb::transfer::Recipient::Endpoint,
+            3 => nusb::transfer::Recipient::Other,
+            _ => unimplemented!(),
+        };
+        if let Some(intf) = interface {
+            if setup.request_type & 0x80 == 0 {
+                // control out
+                let control = nusb::transfer::ControlOut {
+                    control_type,
+                    recipient,
+                    request: setup.request,
+                    value: setup.value,
+                    index: setup.index,
+                    data: req,
+                };
+                intf.control_out(control, timeout).wait()?;
+            } else {
+                // control in
+                let control = nusb::transfer::ControlIn {
+                    control_type,
+                    recipient,
+                    request: setup.request,
+                    value: setup.value,
+                    index: setup.index,
+                    length: setup.length,
+                };
+                if let Ok(buf) = intf.control_in(control, timeout).wait() {
+                    return Ok(buf);
+                }
+            }
+            Ok(vec![])
+        } else {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "Windows requires a claimed interface to perform control transfers",
+            ))
+        }
+    }
 }

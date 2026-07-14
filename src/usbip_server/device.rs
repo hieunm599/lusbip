@@ -569,8 +569,10 @@ impl UsbDevice {
                         && self.device_handler.is_some() =>
                     {
                         let handler = self.device_handler.clone().unwrap();
+                        let intf_handler = self.interfaces.first().map(|i| i.handler.clone());
                         handle_urb_for_device(
                             handler,
+                            intf_handler,
                             transfer_buffer_length,
                             setup_packet,
                             out_data,
@@ -602,8 +604,10 @@ impl UsbDevice {
                         // to device
                         // see https://www.beyondlogic.org/usbnutshell/usb6.shtml
                         let handler = self.device_handler.clone().unwrap();
+                        let intf_handler = self.interfaces.first().map(|i| i.handler.clone());
                         handle_urb_for_device(
                             handler,
+                            intf_handler,
                             transfer_buffer_length,
                             setup_packet,
                             out_data,
@@ -661,8 +665,10 @@ impl UsbDevice {
                         && self.device_handler.is_some() =>
                     {
                         let handler = self.device_handler.clone().unwrap();
+                        let intf_handler = self.interfaces.first().map(|i| i.handler.clone());
                         handle_urb_for_device(
                             handler,
+                            intf_handler,
                             transfer_buffer_length,
                             setup_packet,
                             out_data,
@@ -695,12 +701,17 @@ impl UsbDevice {
                         // to device
                         // see https://www.beyondlogic.org/usbnutshell/usb6.shtml
                         match self.device_handler.clone() {
-                            Some(dh) => handle_urb_for_device(
-                                dh,
-                                transfer_buffer_length,
-                                setup_packet,
-                                out_data,
-                            ),
+                            Some(dh) => {
+                                let intf_handler =
+                                    self.interfaces.first().map(|i| i.handler.clone());
+                                handle_urb_for_device(
+                                    dh,
+                                    intf_handler,
+                                    transfer_buffer_length,
+                                    setup_packet,
+                                    out_data,
+                                )
+                            }
                             None => Ok(Vec::new()),
                         }
                     }
@@ -800,12 +811,10 @@ pub trait UsbDeviceHandler: std::fmt::Debug {
 
     /// Reset the device, forcing it to re-enumerate.
     /// This Device will no longer be usable, and you should drop it and call list_devices to find and re-open it again.
-    #[cfg(not(target_os = "windows"))]
     fn reset(&mut self) -> Result<()>;
 
     /// Set the device configuration.
     /// The argument is the desired configuration’s `bConfigurationValue` descriptor field from `ConfigurationDescriptor::configuration_value` or `0` to unconfigure the device.
-    #[cfg(not(target_os = "windows"))]
     fn set_configuration(&self, setup: &[u8; 8]) -> Result<()>;
 
     /// Helper to downcast to actual struct
