@@ -24,6 +24,10 @@ fn bulk_in_poll_timeout() -> Duration {
     Duration::from_millis(20)
 }
 
+fn interrupt_in_poll_timeout() -> Duration {
+    Duration::from_millis(20)
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum ControlTransport {
     ClaimedInterface,
@@ -319,7 +323,7 @@ pub fn handle_urb_for_interface(
                 .endpoint::<Interrupt, In>(ep.address)?
                 .reader(4096)
                 .with_num_transfers(1)
-                .with_read_timeout(timeout);
+                .with_read_timeout(interrupt_in_poll_timeout());
             let mut buffer = vec![0u8; transfer_buffer_length as usize];
 
             if let Ok(()) = reader.read_exact(&mut buffer) {
@@ -478,12 +482,19 @@ pub fn handle_urb_for_interface(
 
 #[cfg(test)]
 mod tests {
-    use super::{ControlTransport, bulk_in_poll_timeout, select_control_transport};
+    use super::{
+        ControlTransport, bulk_in_poll_timeout, interrupt_in_poll_timeout, select_control_transport,
+    };
     use std::time::Duration;
 
     #[test]
     fn bulk_in_uses_a_short_vendor_independent_poll_timeout() {
         assert_eq!(bulk_in_poll_timeout(), Duration::from_millis(20));
+    }
+
+    #[test]
+    fn interrupt_in_uses_the_same_short_poll_timeout() {
+        assert_eq!(interrupt_in_poll_timeout(), Duration::from_millis(20));
     }
 
     #[test]
