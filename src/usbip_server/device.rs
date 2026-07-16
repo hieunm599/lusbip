@@ -50,6 +50,7 @@ pub struct UsbDevice {
     pub configuration_value: u8,
     pub num_configurations: u8,
     pub interfaces: Vec<UsbInterface>,
+    pub(crate) raw_configuration_descriptors: Vec<Vec<u8>>,
 
     #[cfg_attr(feature = "serde", serde(skip))]
     pub device_handler: Option<Device>,
@@ -69,6 +70,20 @@ pub struct UsbDevice {
 }
 
 impl UsbDevice {
+    fn raw_configuration_descriptor(
+        &self,
+        configuration_index: u8,
+        requested_length: u16,
+    ) -> Option<Vec<u8>> {
+        self.raw_configuration_descriptors
+            .get(configuration_index as usize)
+            .cloned()
+            .map(|mut descriptor| {
+                descriptor.truncate(requested_length as usize);
+                descriptor
+            })
+    }
+
     pub fn new(index: u32) -> Self {
         let mut res = Self {
             #[cfg(target_os = "linux")]
@@ -433,6 +448,12 @@ impl UsbDevice {
                             }
                             Some(Configuration) => {
                                 debug!("Get configuration descriptor");
+                                if let Some(descriptor) = self.raw_configuration_descriptor(
+                                    setup_packet.value as u8,
+                                    setup_packet.length,
+                                ) {
+                                    return Ok(descriptor);
+                                }
                                 // Standard Configuration Descriptor
                                 let mut desc = vec![
                                     0x09,                // bLength
@@ -597,7 +618,6 @@ impl UsbDevice {
                             transfer_buffer_length,
                             setup_packet,
                             out_data,
-                            self.uses_low_latency_bulk_in(),
                         )
                     }
                     _ if setup_packet.request_type & 0xF == 0 && self.device_handler.is_some() => {
@@ -694,7 +714,6 @@ impl UsbDevice {
                             transfer_buffer_length,
                             setup_packet,
                             out_data,
-                            self.uses_low_latency_bulk_in(),
                         )
                     }
                     _ if setup_packet.request_type & 0xF == 0 => {
@@ -751,7 +770,6 @@ impl UsbDevice {
                     transfer_buffer_length,
                     setup_packet,
                     out_data,
-                    self.uses_low_latency_bulk_in(),
                 )
             } // _ => unimplemented!("transfer to {:?}", ep),
         }
@@ -759,10 +777,6 @@ impl UsbDevice {
 }
 
 impl UsbDevice {
-    fn uses_low_latency_bulk_in(&self) -> bool {
-        self.vendor_id == 0x10c4 && self.product_id == 0xea60
-    }
-
     fn should_forward_control_to_device(&self, setup: SetupPacket) -> bool {
         let is_vendor_request = setup.request_type & 0x60 == 0x40;
         let is_interface_recipient = setup.request_type & 0x1f == 0x01;
@@ -871,7 +885,6 @@ mod tests {
         device.vendor_id = 0x10c4;
         device.product_id = 0xea60;
 
-        assert!(device.uses_low_latency_bulk_in());
         assert!(device.should_forward_control_to_device(SetupPacket {
             request_type: 0x41,
             request: 0x00,
@@ -888,7 +901,6 @@ mod tests {
         }));
 
         device.product_id = 0x1234;
-        assert!(!device.uses_low_latency_bulk_in());
         assert!(!device.should_forward_control_to_device(SetupPacket {
             request_type: 0x41,
             request: 0x00,
@@ -917,5 +929,53 @@ mod tests {
             index: 0,
             length: 0,
         }));
+    }
+
+    #[test]
+    fn raw_configuration_descriptor_is_selected_and_truncated() {
+        let mut device = UsbDevice::new(1);
+        device.raw_configuration_descriptors = vec![
+            vec![
+                9,
+                DescriptorType::Configuration as u8,
+                9,
+                0,
+                0,
+                1,
+                0,
+                0x80,
+                50,
+            ],
+            vec![
+                9,
+                DescriptorType::Configuration as u8,
+                9,
+                0,
+                0,
+                2,
+                0,
+                0x80,
+                100,
+            ],
+        ];
+
+        assert_eq!(
+            device.raw_configuration_descriptor(0, 4),
+            Some(vec![9, DescriptorType::Configuration as u8, 9, 0])
+        );
+        assert_eq!(
+            device.raw_configuration_descriptor(1, 64),
+            Some(vec![
+                9,
+                DescriptorType::Configuration as u8,
+                9,
+                0,
+                0,
+                2,
+                0,
+                0x80,
+                100
+            ])
+        );
     }
 }

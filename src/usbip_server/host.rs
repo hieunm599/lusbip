@@ -20,6 +20,24 @@ pub struct NusbUsbHostInterfaceHandler {
     handle: nusb::Interface,
 }
 
+fn bulk_in_poll_timeout() -> Duration {
+    Duration::from_millis(20)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ControlTransport {
+    ClaimedInterface,
+    DeviceHandle,
+}
+
+fn select_control_transport(has_claimed_interface: bool) -> ControlTransport {
+    if has_claimed_interface {
+        ControlTransport::ClaimedInterface
+    } else {
+        ControlTransport::DeviceHandle
+    }
+}
+
 impl std::fmt::Debug for NusbUsbHostInterfaceHandler {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NusbUsbHostInterfaceHandler")
@@ -189,7 +207,6 @@ pub fn handle_urb_for_interface(
     transfer_buffer_length: u32,
     setup: SetupPacket,
     req: &[u8],
-    low_latency_bulk_in: bool,
 ) -> Result<Vec<u8>> {
     let timeout = Duration::new(1, 0);
     // info!(
@@ -389,11 +406,7 @@ pub fn handle_urb_for_interface(
             //     .unwrap();
             let mut ep_in = interface.endpoint::<Bulk, In>(ep.address)?;
             let max_packet_size = ep_in.max_packet_size();
-            let bulk_in_timeout = if low_latency_bulk_in {
-                Duration::from_millis(20)
-            } else {
-                timeout
-            };
+            let bulk_in_timeout = bulk_in_poll_timeout();
 
             let requested_len =
                 ((transfer_buffer_length - 1) as usize / max_packet_size + 1) * max_packet_size;
@@ -401,7 +414,7 @@ pub fn handle_urb_for_interface(
             let c = ep_in.transfer_blocking(buffer, bulk_in_timeout);
             let buf = match c.into_result() {
                 Ok(buf) => buf,
-                Err(TransferError::Cancelled) if low_latency_bulk_in => {
+                Err(TransferError::Cancelled) => {
                     return Ok(Vec::new());
                 }
                 Err(TransferError::Stall) => {
@@ -461,6 +474,29 @@ pub fn handle_urb_for_interface(
         warn!("Other command received, setup: {setup:?}, \nreq: {req:02x?},\ncontrol: {ep:02x?}");
     }
     Ok(vec![])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ControlTransport, bulk_in_poll_timeout, select_control_transport};
+    use std::time::Duration;
+
+    #[test]
+    fn bulk_in_uses_a_short_vendor_independent_poll_timeout() {
+        assert_eq!(bulk_in_poll_timeout(), Duration::from_millis(20));
+    }
+
+    #[test]
+    fn control_transfers_prefer_a_claimed_interface() {
+        assert_eq!(
+            select_control_transport(true),
+            ControlTransport::ClaimedInterface
+        );
+        assert_eq!(
+            select_control_transport(false),
+            ControlTransport::DeviceHandle
+        );
+    }
 }
 
 /// A handler to pass requests to device of a nusb USB device of the host
@@ -647,7 +683,6 @@ pub fn handle_urb_for_device(
 
     #[cfg(not(target_os = "windows"))]
     {
-        let _ = interface;
         let control_type = match (setup.request_type >> 5) & 0b11 {
             0 => nusb::transfer::ControlType::Standard,
             1 => nusb::transfer::ControlType::Class,
@@ -661,6 +696,7 @@ pub fn handle_urb_for_device(
             3 => nusb::transfer::Recipient::Other,
             _ => unimplemented!(),
         };
+        let transport = select_control_transport(interface.is_some());
         if setup.request_type & 0x80 == 0 {
             // control out
             let control = nusb::transfer::ControlOut {
@@ -671,7 +707,12 @@ pub fn handle_urb_for_device(
                 index: setup.index,
                 data: req,
             };
-            device.control_out(control, timeout).wait()?;
+            match transport {
+                ControlTransport::ClaimedInterface => {
+                    interface.unwrap().control_out(control, timeout).wait()?;
+                }
+                ControlTransport::DeviceHandle => device.control_out(control, timeout).wait()?,
+            }
         } else {
             // control in
             let control = nusb::transfer::ControlIn {
@@ -682,7 +723,13 @@ pub fn handle_urb_for_device(
                 index: setup.index,
                 length: setup.length,
             };
-            if let Ok(buf) = device.control_in(control, timeout).wait() {
+            let result = match transport {
+                ControlTransport::ClaimedInterface => {
+                    interface.unwrap().control_in(control, timeout).wait()
+                }
+                ControlTransport::DeviceHandle => device.control_in(control, timeout).wait(),
+            };
+            if let Ok(buf) = result {
                 return Ok(buf);
             }
         }

@@ -4,18 +4,17 @@
 use log::*;
 use num_derive::FromPrimitive;
 use num_traits::FromPrimitive;
-use nusb::transfer::Direction;
-use nusb::{DeviceInfo, Speed};
+use nusb::transfer::{Buffer, Bulk, Direction, In};
+use nusb::{DeviceInfo, Interface, Speed};
 use std::any::Any;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{ErrorKind, Result};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
-use tokio::io::AsyncReadExt;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, mpsc};
+use tokio::task::JoinSet;
 use usbip_protocol::UsbIpCommand;
 
 pub mod cdc;
@@ -42,11 +41,262 @@ use crate::usbip_server::usbip_protocol::{
 
 pub type OccupancyMap = Arc<RwLock<HashMap<String, SocketAddr>>>;
 
+#[derive(Default)]
+struct PendingBulkIn {
+    seqnums: VecDeque<u32>,
+}
+
+impl PendingBulkIn {
+    fn push(&mut self, seqnum: u32) {
+        self.seqnums.push_back(seqnum);
+    }
+
+    #[cfg(test)]
+    fn complete_next(&mut self) -> Option<u32> {
+        self.seqnums.pop_front()
+    }
+
+    fn next(&self) -> Option<u32> {
+        self.seqnums.front().copied()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.seqnums.is_empty()
+    }
+
+    fn unlink(&mut self, seqnum: u32) -> bool {
+        let Some(index) = self.seqnums.iter().position(|pending| *pending == seqnum) else {
+            return false;
+        };
+        self.seqnums.remove(index);
+        true
+    }
+}
+
+struct BulkInRequest {
+    header: UsbIpHeaderBasic,
+    transfer_buffer_length: u32,
+}
+
+enum BulkInCommand {
+    Submit(BulkInRequest),
+    Unlink(u32),
+}
+
+struct BulkInEvent {
+    seqnum: u32,
+    response: UsbIpResponse,
+}
+
+#[derive(Default)]
+struct BulkInState {
+    read_pending: bool,
+}
+
+impl BulkInState {
+    fn start_if_idle(&mut self) -> bool {
+        if self.read_pending {
+            return false;
+        }
+
+        self.read_pending = true;
+        true
+    }
+
+    fn complete(&mut self) {
+        self.read_pending = false;
+    }
+}
+
+fn bulk_in_response_header(mut header: UsbIpHeaderBasic) -> UsbIpHeaderBasic {
+    header.command = USBIP_RET_SUBMIT.into();
+    header.devid = 0;
+    header.direction = 0;
+    header.ep = 0;
+    header
+}
+
+fn should_write_bulk_in_response(cancelled: &mut HashSet<u32>, seqnum: u32) -> bool {
+    !cancelled.remove(&seqnum)
+}
+
+async fn run_bulk_in_worker(
+    interface: Interface,
+    endpoint: UsbEndpoint,
+    mut commands: mpsc::Receiver<BulkInCommand>,
+    events: mpsc::UnboundedSender<BulkInEvent>,
+) {
+    let mut endpoint_in = match interface.endpoint::<Bulk, In>(endpoint.address) {
+        Ok(endpoint_in) => endpoint_in,
+        Err(err) => {
+            warn!(
+                "Unable to open persistent bulk IN endpoint 0x{:02x}: {err}",
+                endpoint.address
+            );
+            return;
+        }
+    };
+    let max_packet_size = endpoint_in.max_packet_size();
+    let mut pending = PendingBulkIn::default();
+    let mut requests = HashMap::<u32, BulkInRequest>::new();
+    let mut state = BulkInState::default();
+    let mut active_seqnum = None;
+
+    loop {
+        if !state.read_pending && !pending.is_empty() {
+            let seqnum = pending.next().expect("non-empty pending queue");
+            let Some(request) = requests.get(&seqnum) else {
+                pending.unlink(seqnum);
+                continue;
+            };
+            let requested_len = request.transfer_buffer_length.max(1) as usize;
+            let transfer_len = requested_len.div_ceil(max_packet_size) * max_packet_size;
+            endpoint_in.submit(Buffer::new(transfer_len));
+            active_seqnum = Some(seqnum);
+            state.start_if_idle();
+        }
+
+        if state.read_pending {
+            tokio::select! {
+                completion = endpoint_in.next_complete() => {
+                    state.complete();
+                    let Some(seqnum) = active_seqnum.take() else {
+                        continue;
+                    };
+                    let still_pending = pending.unlink(seqnum);
+                    let request = requests.remove(&seqnum);
+                    if !still_pending {
+                        continue;
+                    }
+                    let Some(request) = request else {
+                        continue;
+                    };
+                    let header = bulk_in_response_header(request.header);
+                    let response = match completion.into_result() {
+                        Ok(buffer) => UsbIpResponse::usbip_ret_submit_success(
+                            &header,
+                            0,
+                            buffer.len() as u32,
+                            buffer.into_vec(),
+                            vec![],
+                        ),
+                        Err(err) => {
+                            warn!("Bulk IN transfer on endpoint 0x{:02x} failed: {err}", endpoint.address);
+                            UsbIpResponse::usbip_ret_submit_fail(&header, 0)
+                        }
+                    };
+                    if events.send(BulkInEvent { seqnum, response }).is_err() {
+                        return;
+                    }
+                }
+                command = commands.recv() => {
+                    let Some(command) = command else {
+                        endpoint_in.cancel_all();
+                        return;
+                    };
+                    match command {
+                        BulkInCommand::Submit(request) => {
+                            let seqnum = request.header.seqnum;
+                            requests.insert(seqnum, request);
+                            pending.push(seqnum);
+                        }
+                        BulkInCommand::Unlink(seqnum) => {
+                            let was_active = active_seqnum == Some(seqnum);
+                            pending.unlink(seqnum);
+                            requests.remove(&seqnum);
+                            if was_active {
+                                endpoint_in.cancel_all();
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            let Some(command) = commands.recv().await else {
+                return;
+            };
+            match command {
+                BulkInCommand::Submit(request) => {
+                    let seqnum = request.header.seqnum;
+                    requests.insert(seqnum, request);
+                    pending.push(seqnum);
+                }
+                BulkInCommand::Unlink(_) => {}
+            }
+        }
+    }
+}
+
+fn start_bulk_in_workers(
+    device: &UsbDevice,
+    events: mpsc::UnboundedSender<BulkInEvent>,
+    tasks: &mut JoinSet<()>,
+) -> HashMap<u8, mpsc::Sender<BulkInCommand>> {
+    let mut workers = HashMap::new();
+
+    for interface in &device.interfaces {
+        for endpoint in &interface.endpoints {
+            if endpoint.attributes != EndpointAttributes::Bulk as u8
+                || endpoint.direction() != Direction::In
+            {
+                continue;
+            }
+
+            let (commands, receiver) = mpsc::channel(32);
+            tasks.spawn(run_bulk_in_worker(
+                interface.handler.clone(),
+                *endpoint,
+                receiver,
+                events.clone(),
+            ));
+            workers.insert(endpoint.address, commands);
+        }
+    }
+
+    workers
+}
+
+async fn stop_bulk_in_workers(tasks: &mut JoinSet<()>) {
+    tasks.abort_all();
+    while tasks.join_next().await.is_some() {}
+}
+
 /// Main struct of a USB/IP server
 #[derive(Default, Debug)]
 pub struct UsbIpServer {
     available_devices: RwLock<Vec<UsbDevice>>,
     used_devices: RwLock<Vec<UsbDevice>>,
+}
+
+fn prepare_device_for_import(device: UsbDevice) -> UsbDevice {
+    device
+}
+
+fn extract_configuration_descriptors(descriptors: &[u8]) -> Vec<Vec<u8>> {
+    let mut configurations = Vec::new();
+    let mut offset = 0;
+
+    while offset + 2 <= descriptors.len() {
+        let descriptor_length = descriptors[offset] as usize;
+        if descriptor_length < 2 || offset + descriptor_length > descriptors.len() {
+            break;
+        }
+
+        if descriptors[offset + 1] == DescriptorType::Configuration as u8 && descriptor_length >= 9
+        {
+            let total_length =
+                u16::from_le_bytes([descriptors[offset + 2], descriptors[offset + 3]]) as usize;
+            if total_length >= descriptor_length && offset + total_length <= descriptors.len() {
+                configurations.push(descriptors[offset..offset + total_length].to_vec());
+                offset += total_length;
+                continue;
+            }
+        }
+
+        offset += descriptor_length;
+    }
+
+    configurations
 }
 
 impl UsbIpServer {
@@ -107,6 +357,16 @@ impl UsbIpServer {
             };
             let attributes = cfg.attributes();
             let max_power = cfg.max_power();
+            #[cfg(target_os = "linux")]
+            let raw_configuration_descriptors = match std::fs::read(path.join("descriptors")) {
+                Ok(descriptors) => extract_configuration_descriptors(&descriptors),
+                Err(err) => {
+                    warn!("Unable to read host descriptors for {device_info:?}: {err}");
+                    Vec::new()
+                }
+            };
+            #[cfg(not(target_os = "linux"))]
+            let raw_configuration_descriptors = Vec::new();
             let mut interfaces = vec![];
             for intf in cfg.interfaces() {
                 // ignore alternate settings
@@ -204,6 +464,7 @@ impl UsbIpServer {
                     interval: 0,
                 },
                 interfaces,
+                raw_configuration_descriptors,
                 device_handler: Some(dev),
                 usb_version: device_info.usb_version().into(),
                 attributes,
@@ -332,15 +593,12 @@ impl UsbIpServer {
 
     pub async fn occupy(&self, bus_id: &str) -> Result<UsbDevice> {
         let mut ad = self.available_devices.write().await;
-        let mut device = match ad.iter().position(|d| d.bus_id == bus_id) {
+        let device = match ad.iter().position(|d| d.bus_id == bus_id) {
             Some(i) => ad.remove(i),
             None => return Err(std::io::Error::other(format!("No available device"))),
         };
         drop(ad);
-
-        if let Some(reopened_device) = reset_and_reopen_host_device(&device).await {
-            device = reopened_device;
-        }
+        let device = prepare_device_for_import(device);
 
         let mut ud = self.used_devices.write().await;
         if !ud.iter().any(|d| d.bus_id == device.bus_id) {
@@ -530,6 +788,7 @@ impl UsbIpServer {
         &self,
         mut header: UsbIpHeaderBasic,
         unlink_seqnum: u32,
+        was_pending: bool,
     ) -> Result<UsbIpResponse> {
         trace!("Got USBIP_CMD_UNLINK for {unlink_seqnum:10x?}");
 
@@ -539,7 +798,11 @@ impl UsbIpServer {
         header.direction = 0;
         header.ep = 0;
 
-        let res = UsbIpResponse::usbip_ret_unlink_success(&header);
+        let res = if was_pending {
+            UsbIpResponse::usbip_ret_unlink_success(&header)
+        } else {
+            UsbIpResponse::usbip_ret_unlink_fail(&header)
+        };
         trace!("Sent USBIP_RET_UNLINK");
         Ok(res)
     }
@@ -589,62 +852,39 @@ fn dedup_devices_by_bus_id(devices: &mut Vec<UsbDevice>) {
     devices.retain(|device| seen.insert(device.bus_id.clone()));
 }
 
-async fn reset_and_reopen_host_device(device: &UsbDevice) -> Option<UsbDevice> {
-    let bus_id = device.bus_id.clone();
-    if let Some(handle) = device.device_handler.clone() {
-        if let Err(err) = handle.reset().await {
-            warn!("USB device {bus_id} reset returned an error, attempting reopen anyway: {err}");
-        }
-        tokio::time::sleep(Duration::from_millis(3000)).await;
-    }
-
-    let serial = device
-        .string_pool
-        .get(&device.string_serial)
-        .map(String::as_str);
-    let device_info = match nusb::list_devices().await.ok()?.find(|info| {
-        host_export_bus_id(info) == bus_id
-            || (info.vendor_id() == device.vendor_id
-                && info.product_id() == device.product_id
-                && serial.is_none_or(|serial| info.serial_number() == Some(serial)))
-    }) {
-        Some(info) => info,
-        None => {
-            warn!("Unable to find USB device {bus_id} after reset");
-            return None;
-        }
-    };
-
-    UsbIpServer::with_nusb_devices(vec![device_info])
-        .await
-        .into_iter()
-        .next()
-}
-
-pub async fn handler<T: AsyncReadExt + AsyncWriteExt + Unpin>(
+pub async fn handler<T: AsyncRead + AsyncWrite + Unpin>(
     socket: &mut T,
     server: Arc<UsbIpServer>,
     imported_device: &mut Option<UsbDevice>,
     occupancy: Option<(SocketAddr, OccupancyMap)>,
 ) -> Result<()> {
-    loop {
-        let command = match UsbIpCommand::read_from_socket(socket).await {
-            Ok(c) => c,
-            Err(err) => {
-                if let Some(dev) = imported_device.take() {
-                    clear_occupancy(&occupancy, &dev.bus_id).await;
-                    server.release(dev).await;
-                }
-                if err.kind() == ErrorKind::UnexpectedEof {
-                    info!("Remote closed the connection");
-                    return Ok(());
-                } else {
-                    return Err(err);
-                }
-            }
-        };
+    let (mut reader, mut writer) = tokio::io::split(socket);
+    let (bulk_in_events, mut bulk_in_events_rx) = mpsc::unbounded_channel::<BulkInEvent>();
+    let mut bulk_in_workers = HashMap::<u8, mpsc::Sender<BulkInCommand>>::new();
+    let mut bulk_in_seqnums = HashMap::<u32, u8>::new();
+    let mut cancelled_bulk_in_seqnums = HashSet::<u32>::new();
+    let mut bulk_in_tasks = JoinSet::new();
 
-        match command {
+    loop {
+        tokio::select! {
+            command = UsbIpCommand::read_from_socket(&mut reader) => {
+                let command = match command {
+                    Ok(command) => command,
+                    Err(err) => {
+                        stop_bulk_in_workers(&mut bulk_in_tasks).await;
+                        if let Some(dev) = imported_device.take() {
+                            clear_occupancy(&occupancy, &dev.bus_id).await;
+                            server.release(dev).await;
+                        }
+                        if err.kind() == ErrorKind::UnexpectedEof {
+                            info!("Remote closed the connection");
+                            return Ok(());
+                        }
+                        return Err(err);
+                    }
+                };
+
+                match command {
             UsbIpCommand::OpReqDevlist { .. } => {
                 let response = match &occupancy {
                     Some((_, occupancy)) => {
@@ -654,21 +894,30 @@ pub async fn handler<T: AsyncReadExt + AsyncWriteExt + Unpin>(
                 };
                 match response {
                     Ok(r) => {
-                        r.write_to_socket(socket).await?;
+                        r.write_to_socket(&mut writer).await?;
                     }
                     Err(e) => error!("UsbipCommand OpReqDevlist handling error: {e:?}"),
                 }
             }
             UsbIpCommand::OpReqImport { busid, .. } => {
+                stop_bulk_in_workers(&mut bulk_in_tasks).await;
+                bulk_in_workers.clear();
+                bulk_in_seqnums.clear();
+                cancelled_bulk_in_seqnums.clear();
                 let previous_bus_id = imported_device.as_ref().map(|dev| dev.bus_id.clone());
                 match server.handle_op_req_import(busid, imported_device).await {
                     Ok(r) => {
-                        r.write_to_socket(socket).await?;
+                        r.write_to_socket(&mut writer).await?;
                         if let Some(bus_id) = previous_bus_id {
                             clear_occupancy(&occupancy, &bus_id).await;
                         }
                         if let Some(dev) = imported_device.as_ref() {
                             set_occupancy(&occupancy, dev.bus_id.clone()).await;
+                            bulk_in_workers = start_bulk_in_workers(
+                                dev,
+                                bulk_in_events.clone(),
+                                &mut bulk_in_tasks,
+                            );
                         }
                     }
                     Err(e) => {
@@ -695,6 +944,25 @@ pub async fn handler<T: AsyncReadExt + AsyncWriteExt + Unpin>(
                         continue;
                     }
                 };
+                let real_ep = if header.direction == 0 {
+                    header.ep as u8
+                } else {
+                    (header.ep | 0x80) as u8
+                };
+                if header.direction == 1 {
+                    if let Some(worker) = bulk_in_workers.get(&real_ep) {
+                        let seqnum = header.seqnum;
+                        let request = BulkInRequest {
+                            header: header.clone(),
+                            transfer_buffer_length,
+                        };
+                        if worker.send(BulkInCommand::Submit(request)).await.is_ok() {
+                            bulk_in_seqnums.insert(seqnum, real_ep);
+                            continue;
+                        }
+                        warn!("Persistent bulk IN worker for endpoint 0x{real_ep:02x} stopped");
+                    }
+                }
                 match server.handle_usbip_cmd_submit(
                     header,
                     transfer_buffer_length,
@@ -702,21 +970,36 @@ pub async fn handler<T: AsyncReadExt + AsyncWriteExt + Unpin>(
                     data,
                     device,
                 ) {
-                    Ok(r) => {
-                        r.write_to_socket(socket).await?;
-                    }
+                    Ok(r) => r.write_to_socket(&mut writer).await?,
                     Err(e) => error!("UsbipCmdSubmit handling error: {e:?}"),
                 }
             }
             UsbIpCommand::UsbIpCmdUnlink {
                 header,
                 unlink_seqnum,
-            } => match server.handle_usbip_cmd_unlink(header, unlink_seqnum) {
-                Ok(r) => {
-                    r.write_to_socket(socket).await?;
+            } => {
+                let was_pending = if let Some(endpoint) = bulk_in_seqnums.remove(&unlink_seqnum) {
+                    cancelled_bulk_in_seqnums.insert(unlink_seqnum);
+                    if let Some(worker) = bulk_in_workers.get(&endpoint) {
+                        let _ = worker.send(BulkInCommand::Unlink(unlink_seqnum)).await;
+                    }
+                    true
+                } else {
+                    false
+                };
+                match server.handle_usbip_cmd_unlink(header, unlink_seqnum, was_pending) {
+                    Ok(r) => r.write_to_socket(&mut writer).await?,
+                    Err(e) => error!("UsbipCmdUnlink handling error: {e:?}"),
                 }
-                Err(e) => error!("UsbipCmdUnlink handling error: {e:?}"),
-            },
+            }
+                }
+            }
+            Some(event) = bulk_in_events_rx.recv() => {
+                bulk_in_seqnums.remove(&event.seqnum);
+                if should_write_bulk_in_response(&mut cancelled_bulk_in_seqnums, event.seqnum) {
+                    event.response.write_to_socket(&mut writer).await?;
+                }
+            }
         }
     }
 }
@@ -800,5 +1083,80 @@ pub async fn server_with_occupancy_listener(
                 new_server.release(dev).await;
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        BulkInState, PendingBulkIn, UsbDevice, extract_configuration_descriptors,
+        prepare_device_for_import, should_write_bulk_in_response,
+    };
+    use std::collections::HashSet;
+
+    #[test]
+    fn pending_bulk_in_completes_in_submission_order() {
+        let mut pending = PendingBulkIn::default();
+        pending.push(10);
+        pending.push(20);
+
+        assert_eq!(pending.complete_next(), Some(10));
+        assert_eq!(pending.complete_next(), Some(20));
+    }
+
+    #[test]
+    fn pending_bulk_in_unlink_removes_only_target_request() {
+        let mut pending = PendingBulkIn::default();
+        pending.push(10);
+        pending.push(20);
+
+        assert!(pending.unlink(10));
+        assert_eq!(pending.complete_next(), Some(20));
+    }
+
+    #[test]
+    fn bulk_in_worker_submits_once_while_a_read_is_pending() {
+        let mut state = BulkInState::default();
+
+        assert!(state.start_if_idle());
+        assert!(!state.start_if_idle());
+        state.complete();
+        assert!(state.start_if_idle());
+    }
+
+    #[test]
+    fn cancelled_bulk_in_response_is_not_written() {
+        let mut cancelled = HashSet::from([20]);
+
+        assert!(!should_write_bulk_in_response(&mut cancelled, 20));
+        assert!(should_write_bulk_in_response(&mut cancelled, 21));
+    }
+
+    #[test]
+    fn import_preserves_the_existing_claimed_device() {
+        let device = UsbDevice {
+            bus_id: "7-1".into(),
+            ..UsbDevice::default()
+        };
+
+        let prepared = prepare_device_for_import(device.clone());
+
+        assert_eq!(prepared.bus_id, device.bus_id);
+    }
+
+    #[test]
+    fn extracts_each_complete_configuration_descriptor_from_sysfs_bytes() {
+        let descriptors = vec![
+            18, 1, 0, 2, 0, 0, 0, 64, 0x3a, 0x30, 1, 0x10, 2, 1, 1, 2, 3, 1, 9, 2, 18, 0, 1, 1, 0,
+            0x80, 50, 9, 4, 0, 0, 0, 2, 2, 0, 0, 9, 2, 9, 0, 0, 2, 0, 0x80, 100,
+        ];
+
+        assert_eq!(
+            extract_configuration_descriptors(&descriptors),
+            vec![
+                vec![9, 2, 18, 0, 1, 1, 0, 0x80, 50, 9, 4, 0, 0, 0, 2, 2, 0, 0],
+                vec![9, 2, 9, 0, 0, 2, 0, 0x80, 100],
+            ]
+        );
     }
 }
