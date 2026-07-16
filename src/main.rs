@@ -18,7 +18,15 @@ async fn main() {
             )
             .await
         }
-        Commands::Client(args) => lusbip::app_tui::run(args.remote.as_deref(), args.tcp_port).await,
+        Commands::Client(args) => {
+            lusbip::app_tui::run(
+                args.remote.as_deref(),
+                args.tcp_port,
+                args.background,
+                args.agent_child,
+            )
+            .await
+        }
         Commands::Attach(args) => {
             lusbip::client::run_attach(&args.remote, args.tcp_port, args.bus_id.as_deref())
         }
@@ -27,7 +35,15 @@ async fn main() {
         Commands::Doctor(args) => {
             lusbip::client::run_doctor(args.remote.as_deref(), args.tcp_port, args.fix)
         }
-        Commands::Tui(args) => lusbip::app_tui::run(args.remote.as_deref(), args.tcp_port).await,
+        Commands::Tui(args) => {
+            lusbip::app_tui::run(
+                args.remote.as_deref(),
+                args.tcp_port,
+                args.background,
+                args.agent_child,
+            )
+            .await
+        }
     };
 
     if let Err(err) = result {

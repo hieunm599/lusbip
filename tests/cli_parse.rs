@@ -38,6 +38,27 @@ fn parses_client_command_as_interactive_ui() {
 }
 
 #[test]
+fn parses_client_background_mode() {
+    let cli = Cli::parse_from([
+        "lusbip",
+        "client",
+        "--remote",
+        "10.10.61.72",
+        "--tcp-port",
+        "3240",
+        "--background",
+    ]);
+
+    assert!(matches!(
+        cli.command,
+        Commands::Client(args)
+            if args.background
+                && args.remote.as_deref() == Some("10.10.61.72")
+                && args.tcp_port == 3240
+    ));
+}
+
+#[test]
 fn parses_attach_command_with_remote_and_bus_id() {
     let cli = Cli::parse_from([
         "lusbip",

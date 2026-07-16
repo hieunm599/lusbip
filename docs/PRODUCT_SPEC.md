@@ -29,7 +29,7 @@ Tên binary: `lusbip`.
 ```text
 lusbip list
 lusbip server [--vid <HEX>] [--pid <HEX>] [--bus-id <BUS_ID>] [--host <IP>] [--port <PORT>]
-lusbip client --remote <IP> [--tcp-port <PORT>]
+lusbip client --remote <IP> [--tcp-port <PORT>] [--background]
 lusbip attach --remote <IP> [--bus-id <BUS_ID>] [--tcp-port <PORT>]
 lusbip detach --port <PORT>
 lusbip status [--remote <IP>] [--tcp-port <PORT>]
@@ -57,6 +57,7 @@ Mặc định:
 - Khi attach/detach đang xử lý lâu, UI chỉ hiển thị spinner quay ở đuôi dòng thiết bị đang xử lý, và refresh trạng thái sau khi command hoàn tất mà không thoát màn hình.
 - Khi nhấn Esc trong client TUI, client thoát màn UI và giữ các USB/IP port đang attached chạy nền.
 - Khi nhấn Ctrl+C trong client TUI, client detach các USB/IP port đang attached trong màn hiện tại rồi mới thoát.
+- `client --background` chạy agent quản lý riêng cho đúng cặp remote/port. Gọi lại `client` cùng remote/port sẽ vào TUI điều khiển agent thay vì bị chặn bởi lock; Esc chỉ đóng TUI, còn Ctrl+C detach các port do agent quản lý rồi dừng agent.
 - Trước khi attach, `client`/`attach` phải kiểm tra `usbip port` và tự detach stale port liên quan đến remote host/bus id/VID:PID hiện tại.
 - Không detach toàn bộ USB/IP port bừa bãi. Nếu không xác định chắc port nào thuộc target hiện tại, CLI phải hỏi người dùng hoặc fail rõ với output `usbip port`.
 - `detach --port <PORT>` chạy `sudo usbip detach -p <PORT>` để gỡ thủ công một USB/IP port.

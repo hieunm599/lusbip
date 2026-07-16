@@ -86,6 +86,10 @@ pub struct TuiArgs {
     pub remote: Option<String>,
     #[arg(long, default_value_t = 3240)]
     pub tcp_port: u16,
+    #[arg(long)]
+    pub background: bool,
+    #[arg(long, hide = true)]
+    pub agent_child: bool,
 }
 
 pub fn parse_hex_u16(value: &str) -> Result<u16, String> {
