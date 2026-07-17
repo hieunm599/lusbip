@@ -79,6 +79,10 @@ fn should_submit_bulk_in_after_barrier(pending: &PendingBulkIn, seqnum: u32) -> 
     pending.next() == Some(seqnum)
 }
 
+fn requires_bulk_out_control_barrier(real_ep: u8) -> bool {
+    real_ep == 0 || real_ep == 0x80
+}
+
 #[derive(Default)]
 struct PendingBulkOut {
     seqnums: HashSet<u32>,
@@ -228,6 +232,15 @@ async fn flush_bulk_out_before_read(
     result
         .await
         .map_err(|_| std::io::Error::other("bulk OUT worker dropped read barrier"))?
+}
+
+async fn flush_bulk_out_before_control(
+    out_workers: &HashMap<u8, mpsc::Sender<BulkOutCommand>>,
+) -> std::io::Result<()> {
+    for out_worker in out_workers.values() {
+        flush_bulk_out_before_read(&Some(out_worker.clone())).await?;
+    }
+    Ok(())
 }
 
 async fn write_buffered_bulk_out(
@@ -1370,6 +1383,22 @@ pub async fn handler<T: AsyncRead + AsyncWrite + Unpin>(
                         }
                     }
                 }
+                if requires_bulk_out_control_barrier(real_ep) {
+                    if let Err(err) = flush_bulk_out_before_control(&bulk_out_workers).await {
+                        warn!(
+                            "Bulk OUT flush before control transfer on endpoint 0x{real_ep:02x} failed: {err}"
+                        );
+                        let mut failed_header = header;
+                        failed_header.command = USBIP_RET_SUBMIT.into();
+                        failed_header.devid = 0;
+                        failed_header.direction = 0;
+                        failed_header.ep = 0;
+                        UsbIpResponse::usbip_ret_submit_fail(&failed_header, 0)
+                            .write_to_socket(&mut writer)
+                            .await?;
+                        continue;
+                    }
+                }
                 match server.handle_usbip_cmd_submit(
                     header,
                     transfer_buffer_length,
@@ -1512,8 +1541,8 @@ mod tests {
     use super::{
         BufferedBulkOutState, BulkInState, BulkOutHealth, EndpointAttributes, PendingBulkIn,
         PendingBulkOut, UsbDevice, extract_configuration_descriptors, prepare_device_for_import,
-        should_submit_bulk_in_after_barrier, should_write_bulk_in_response,
-        should_write_bulk_out_response, uses_bulk_out_worker,
+        requires_bulk_out_control_barrier, should_submit_bulk_in_after_barrier,
+        should_write_bulk_in_response, should_write_bulk_out_response, uses_bulk_out_worker,
     };
     use std::collections::HashSet;
 
@@ -1581,6 +1610,14 @@ mod tests {
         assert!(state.needs_flush());
         state.mark_flushed();
         assert!(!state.needs_flush());
+    }
+
+    #[test]
+    fn control_submit_requires_bulk_out_barrier() {
+        assert!(requires_bulk_out_control_barrier(0));
+        assert!(requires_bulk_out_control_barrier(0x80));
+        assert!(!requires_bulk_out_control_barrier(0x02));
+        assert!(!requires_bulk_out_control_barrier(0x82));
     }
 
     #[test]
