@@ -547,10 +547,10 @@ impl UsbDevice {
                                     }
                                     Ok(desc)
                                 } else {
-                                    Err(std::io::Error::new(
-                                        std::io::ErrorKind::InvalidInput,
-                                        format!("Invalid string index: {index}"),
-                                    ))
+                                    // Hosts routinely probe optional descriptors such as the
+                                    // Microsoft OS string descriptor at index 0xEE. A device
+                                    // without that string must not abort enumeration.
+                                    Ok(Vec::new())
                                 }
                             }
                             Some(DeviceQualifier) => {
@@ -648,21 +648,6 @@ impl UsbDevice {
                             self.configuration_value, // bConfigurationValue
                         ];
                         if let Some(device) = self.device_handler.clone() {
-                            #[cfg(target_os = "linux")]
-                            match intf {
-                                Some(i) => {
-                                    if let Err(e) =
-                                        device.detach_kernel_driver(i.handler.interface_number())
-                                    {
-                                        error!("Failed to detach kernel driver: {e:?}");
-                                    }
-                                }
-                                None => {
-                                    if let Err(e) = device.detach_kernel_driver(0) {
-                                        error!("Failed to detach kernel driver: {e:?}");
-                                    }
-                                }
-                            }
                             if self.should_forward_set_configuration(setup_packet.value as u8) {
                                 if let Err(e) =
                                     device.set_configuration(setup_packet.value as u8).wait()
@@ -870,6 +855,26 @@ mod tests {
         assert!(!device.should_forward_set_configuration(1));
         assert!(device.should_forward_set_configuration(0));
         assert!(device.should_forward_set_configuration(2));
+    }
+
+    #[test]
+    fn unsupported_string_descriptor_is_acknowledged_without_failing_enumeration() {
+        let device = UsbDevice::new(1);
+        let result = device.handle_urb(
+            device.ep0_in.clone(),
+            None,
+            1024,
+            SetupPacket {
+                request_type: 0x80,
+                request: 6,
+                value: 0x03ee,
+                index: 0,
+                length: 1024,
+            },
+            &[],
+        );
+
+        assert_eq!(result.unwrap(), Vec::<u8>::new());
     }
 
     #[test]
