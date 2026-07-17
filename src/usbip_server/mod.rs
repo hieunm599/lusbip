@@ -4,8 +4,8 @@
 use log::*;
 use num_derive::FromPrimitive;
 use num_traits::FromPrimitive;
-use nusb::transfer::{Buffer, Bulk, Direction, In};
-use nusb::{DeviceInfo, Interface, Speed};
+use nusb::transfer::{Buffer, Bulk, Direction, In, Out};
+use nusb::{DeviceInfo, Endpoint, Interface, Speed};
 use std::any::Any;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{ErrorKind, Result};
@@ -73,6 +73,25 @@ impl PendingBulkIn {
     }
 }
 
+#[derive(Default)]
+struct PendingBulkOut {
+    seqnums: HashSet<u32>,
+}
+
+impl PendingBulkOut {
+    fn push(&mut self, seqnum: u32) {
+        self.seqnums.insert(seqnum);
+    }
+
+    fn complete(&mut self, seqnum: u32) -> bool {
+        self.seqnums.remove(&seqnum)
+    }
+
+    fn unlink(&mut self, seqnum: u32) -> bool {
+        self.seqnums.remove(&seqnum)
+    }
+}
+
 struct BulkInRequest {
     header: UsbIpHeaderBasic,
     transfer_buffer_length: u32,
@@ -86,6 +105,31 @@ enum BulkInCommand {
 struct BulkInEvent {
     seqnum: u32,
     response: UsbIpResponse,
+}
+
+struct BulkOutRequest {
+    header: UsbIpHeaderBasic,
+    data: Vec<u8>,
+    generation: u64,
+}
+
+enum BulkOutCommand {
+    Submit(BulkOutRequest),
+    Unlink(u32),
+}
+
+struct BulkOutEvent {
+    seqnum: u32,
+    generation: u64,
+    response: UsbIpResponse,
+}
+
+fn uses_bulk_out_worker(endpoint_attributes: u8, direction: u32) -> bool {
+    endpoint_attributes == EndpointAttributes::Bulk as u8 && direction == 0
+}
+
+fn should_write_bulk_out_response(active_generation: u64, event_generation: u64) -> bool {
+    active_generation == event_generation
 }
 
 #[derive(Default)]
@@ -115,6 +159,8 @@ fn bulk_in_response_header(mut header: UsbIpHeaderBasic) -> UsbIpHeaderBasic {
     header.ep = 0;
     header
 }
+
+const BULK_OUT_IN_FLIGHT_LIMIT: usize = 32;
 
 fn should_write_bulk_in_response(cancelled: &mut HashSet<u32>, seqnum: u32) -> bool {
     !cancelled.remove(&seqnum)
@@ -227,6 +273,96 @@ async fn run_bulk_in_worker(
     }
 }
 
+async fn run_bulk_out_worker(
+    mut endpoint_out: Endpoint<Bulk, Out>,
+    endpoint: UsbEndpoint,
+    mut commands: mpsc::Receiver<BulkOutCommand>,
+    events: mpsc::UnboundedSender<BulkOutEvent>,
+) {
+    let mut queued = VecDeque::<BulkOutRequest>::new();
+    let mut submitted = VecDeque::<BulkOutRequest>::new();
+    let mut commands_open = true;
+
+    loop {
+        while commands_open && queued.len() + submitted.len() < BULK_OUT_IN_FLIGHT_LIMIT {
+            match commands.try_recv() {
+                Ok(BulkOutCommand::Submit(request)) => queued.push_back(request),
+                Ok(BulkOutCommand::Unlink(seqnum)) => {
+                    if let Some(position) = queued
+                        .iter()
+                        .position(|request| request.header.seqnum == seqnum)
+                    {
+                        queued.remove(position);
+                    }
+                }
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => commands_open = false,
+            }
+        }
+
+        while submitted.len() < BULK_OUT_IN_FLIGHT_LIMIT {
+            let Some(request) = queued.pop_front() else {
+                break;
+            };
+            endpoint_out.submit(Buffer::from(request.data.clone()));
+            submitted.push_back(request);
+        }
+
+        if submitted.is_empty() {
+            if !commands_open {
+                return;
+            }
+            match commands.recv().await {
+                Some(BulkOutCommand::Submit(request)) => queued.push_back(request),
+                Some(BulkOutCommand::Unlink(_)) => {}
+                None => commands_open = false,
+            }
+            continue;
+        }
+
+        tokio::select! {
+            completion = endpoint_out.next_complete() => {
+                let request = submitted.pop_front().expect("bulk OUT completion without request");
+                let header = bulk_in_response_header(request.header.clone());
+                let response = match completion.into_result() {
+                    Ok(buffer) => UsbIpResponse::usbip_ret_submit_success(
+                        &header,
+                        0,
+                        buffer.len() as u32,
+                        Vec::new(),
+                        vec![],
+                    ),
+                    Err(err) => {
+                        warn!("Bulk OUT transfer on endpoint 0x{:02x} failed: {err}", endpoint.address);
+                        UsbIpResponse::usbip_ret_submit_fail(&header, 0)
+                    }
+                };
+                if events.send(BulkOutEvent {
+                    seqnum: request.header.seqnum,
+                    generation: request.generation,
+                    response,
+                }).is_err() {
+                    return;
+                }
+            }
+            command = commands.recv(), if commands_open => {
+                match command {
+                    Some(BulkOutCommand::Submit(request)) => queued.push_back(request),
+                    Some(BulkOutCommand::Unlink(seqnum)) => {
+                        if let Some(position) = queued
+                            .iter()
+                            .position(|request| request.header.seqnum == seqnum)
+                        {
+                            queued.remove(position);
+                        }
+                    }
+                    None => commands_open = false,
+                }
+            }
+        }
+    }
+}
+
 fn start_bulk_in_workers(
     device: &UsbDevice,
     events: mpsc::UnboundedSender<BulkInEvent>,
@@ -257,6 +393,54 @@ fn start_bulk_in_workers(
 }
 
 async fn stop_bulk_in_workers(tasks: &mut JoinSet<()>) {
+    tasks.abort_all();
+    while tasks.join_next().await.is_some() {}
+}
+
+fn start_bulk_out_workers(
+    device: &UsbDevice,
+    events: mpsc::UnboundedSender<BulkOutEvent>,
+    tasks: &mut JoinSet<()>,
+) -> HashMap<u8, mpsc::Sender<BulkOutCommand>> {
+    let mut workers = HashMap::new();
+
+    for interface in &device.interfaces {
+        for endpoint in &interface.endpoints {
+            if endpoint.attributes != EndpointAttributes::Bulk as u8
+                || endpoint.direction() != Direction::Out
+            {
+                continue;
+            }
+
+            let endpoint_out = match interface
+                .handler
+                .clone()
+                .endpoint::<Bulk, Out>(endpoint.address)
+            {
+                Ok(endpoint_out) => endpoint_out,
+                Err(err) => {
+                    warn!(
+                        "Unable to open persistent bulk OUT endpoint 0x{:02x}: {err}",
+                        endpoint.address
+                    );
+                    continue;
+                }
+            };
+            let (commands, receiver) = mpsc::channel(256);
+            tasks.spawn(run_bulk_out_worker(
+                endpoint_out,
+                *endpoint,
+                receiver,
+                events.clone(),
+            ));
+            workers.insert(endpoint.address, commands);
+        }
+    }
+
+    workers
+}
+
+async fn stop_bulk_out_workers(tasks: &mut JoinSet<()>) {
     tasks.abort_all();
     while tasks.join_next().await.is_some() {}
 }
@@ -860,10 +1044,16 @@ pub async fn handler<T: AsyncRead + AsyncWrite + Unpin>(
 ) -> Result<()> {
     let (mut reader, mut writer) = tokio::io::split(socket);
     let (bulk_in_events, mut bulk_in_events_rx) = mpsc::unbounded_channel::<BulkInEvent>();
+    let (bulk_out_events, mut bulk_out_events_rx) = mpsc::unbounded_channel::<BulkOutEvent>();
     let mut bulk_in_workers = HashMap::<u8, mpsc::Sender<BulkInCommand>>::new();
+    let mut bulk_out_workers = HashMap::<u8, mpsc::Sender<BulkOutCommand>>::new();
     let mut bulk_in_seqnums = HashMap::<u32, u8>::new();
+    let mut bulk_out_seqnums = HashMap::<u32, u8>::new();
     let mut cancelled_bulk_in_seqnums = HashSet::<u32>::new();
+    let mut pending_bulk_out = PendingBulkOut::default();
+    let mut bulk_out_generation = 0u64;
     let mut bulk_in_tasks = JoinSet::new();
+    let mut bulk_out_tasks = JoinSet::new();
 
     loop {
         tokio::select! {
@@ -872,6 +1062,7 @@ pub async fn handler<T: AsyncRead + AsyncWrite + Unpin>(
                     Ok(command) => command,
                     Err(err) => {
                         stop_bulk_in_workers(&mut bulk_in_tasks).await;
+                        stop_bulk_out_workers(&mut bulk_out_tasks).await;
                         if let Some(dev) = imported_device.take() {
                             clear_occupancy(&occupancy, &dev.bus_id).await;
                             server.release(dev).await;
@@ -901,9 +1092,14 @@ pub async fn handler<T: AsyncRead + AsyncWrite + Unpin>(
             }
             UsbIpCommand::OpReqImport { busid, .. } => {
                 stop_bulk_in_workers(&mut bulk_in_tasks).await;
+                stop_bulk_out_workers(&mut bulk_out_tasks).await;
                 bulk_in_workers.clear();
+                bulk_out_workers.clear();
                 bulk_in_seqnums.clear();
+                bulk_out_seqnums.clear();
                 cancelled_bulk_in_seqnums.clear();
+                pending_bulk_out = PendingBulkOut::default();
+                bulk_out_generation = bulk_out_generation.wrapping_add(1);
                 let previous_bus_id = imported_device.as_ref().map(|dev| dev.bus_id.clone());
                 match server.handle_op_req_import(busid, imported_device).await {
                     Ok(r) => {
@@ -917,6 +1113,11 @@ pub async fn handler<T: AsyncRead + AsyncWrite + Unpin>(
                                 dev,
                                 bulk_in_events.clone(),
                                 &mut bulk_in_tasks,
+                            );
+                            bulk_out_workers = start_bulk_out_workers(
+                                dev,
+                                bulk_out_events.clone(),
+                                &mut bulk_out_tasks,
                             );
                         }
                     }
@@ -963,6 +1164,24 @@ pub async fn handler<T: AsyncRead + AsyncWrite + Unpin>(
                         warn!("Persistent bulk IN worker for endpoint 0x{real_ep:02x} stopped");
                     }
                 }
+                if let Some((endpoint, _)) = device.find_ep(real_ep) {
+                    if uses_bulk_out_worker(endpoint.attributes, header.direction) {
+                        if let Some(worker) = bulk_out_workers.get(&real_ep) {
+                            let seqnum = header.seqnum;
+                            let request = BulkOutRequest {
+                                header: header.clone(),
+                                data: data.clone(),
+                                generation: bulk_out_generation,
+                            };
+                            if worker.send(BulkOutCommand::Submit(request)).await.is_ok() {
+                                pending_bulk_out.push(seqnum);
+                                bulk_out_seqnums.insert(seqnum, real_ep);
+                                continue;
+                            }
+                            warn!("Persistent bulk OUT worker for endpoint 0x{real_ep:02x} stopped");
+                        }
+                    }
+                }
                 match server.handle_usbip_cmd_submit(
                     header,
                     transfer_buffer_length,
@@ -984,6 +1203,12 @@ pub async fn handler<T: AsyncRead + AsyncWrite + Unpin>(
                         let _ = worker.send(BulkInCommand::Unlink(unlink_seqnum)).await;
                     }
                     true
+                } else if let Some(endpoint) = bulk_out_seqnums.remove(&unlink_seqnum) {
+                    let was_pending = pending_bulk_out.unlink(unlink_seqnum);
+                    if let Some(worker) = bulk_out_workers.get(&endpoint) {
+                        let _ = worker.send(BulkOutCommand::Unlink(unlink_seqnum)).await;
+                    }
+                    was_pending
                 } else {
                     false
                 };
@@ -998,6 +1223,14 @@ pub async fn handler<T: AsyncRead + AsyncWrite + Unpin>(
                 bulk_in_seqnums.remove(&event.seqnum);
                 if should_write_bulk_in_response(&mut cancelled_bulk_in_seqnums, event.seqnum) {
                     event.response.write_to_socket(&mut writer).await?;
+                }
+            }
+            Some(event) = bulk_out_events_rx.recv() => {
+                if should_write_bulk_out_response(bulk_out_generation, event.generation) {
+                    bulk_out_seqnums.remove(&event.seqnum);
+                    if pending_bulk_out.complete(event.seqnum) {
+                        event.response.write_to_socket(&mut writer).await?;
+                    }
                 }
             }
         }
@@ -1089,8 +1322,9 @@ pub async fn server_with_occupancy_listener(
 #[cfg(test)]
 mod tests {
     use super::{
-        BulkInState, PendingBulkIn, UsbDevice, extract_configuration_descriptors,
-        prepare_device_for_import, should_write_bulk_in_response,
+        BulkInState, EndpointAttributes, PendingBulkIn, PendingBulkOut, UsbDevice,
+        extract_configuration_descriptors, prepare_device_for_import,
+        should_write_bulk_in_response, should_write_bulk_out_response, uses_bulk_out_worker,
     };
     use std::collections::HashSet;
 
@@ -1130,6 +1364,40 @@ mod tests {
 
         assert!(!should_write_bulk_in_response(&mut cancelled, 20));
         assert!(should_write_bulk_in_response(&mut cancelled, 21));
+    }
+
+    #[test]
+    fn bulk_out_completion_is_written_once() {
+        let mut pending = PendingBulkOut::default();
+        pending.push(7);
+
+        assert!(pending.complete(7));
+        assert!(!pending.complete(7));
+    }
+
+    #[test]
+    fn unlinked_bulk_out_request_does_not_complete_later() {
+        let mut pending = PendingBulkOut::default();
+        pending.push(7);
+
+        assert!(pending.unlink(7));
+        assert!(!pending.complete(7));
+    }
+
+    #[test]
+    fn only_bulk_out_urbs_use_the_persistent_worker() {
+        assert!(uses_bulk_out_worker(EndpointAttributes::Bulk as u8, 0));
+        assert!(!uses_bulk_out_worker(EndpointAttributes::Bulk as u8, 1));
+        assert!(!uses_bulk_out_worker(
+            EndpointAttributes::Interrupt as u8,
+            0
+        ));
+    }
+
+    #[test]
+    fn stale_bulk_out_completion_is_not_written_after_reimport() {
+        assert!(!should_write_bulk_out_response(2, 1));
+        assert!(should_write_bulk_out_response(2, 2));
     }
 
     #[test]
