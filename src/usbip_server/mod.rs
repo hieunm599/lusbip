@@ -211,10 +211,7 @@ fn bulk_in_response_header(mut header: UsbIpHeaderBasic) -> UsbIpHeaderBasic {
 
 const BULK_OUT_WRITE_BUFFER_SIZE: usize = 4096;
 const BULK_OUT_WRITE_TRANSFERS: usize = 4;
-// USB/IP round trips on the LAN are longer than a CH340 bulk URB. Keep a
-// serial burst buffered until its read/control barrier arrives instead of
-// flushing every 32-byte URB between those round trips.
-const BULK_OUT_IDLE_FLUSH_DELAY: Duration = Duration::from_millis(50);
+const BULK_OUT_IDLE_FLUSH_DELAY: Duration = Duration::from_millis(2);
 const BULK_OUT_IO_TIMEOUT: Duration = Duration::from_secs(1);
 
 fn should_write_bulk_in_response(cancelled: &mut HashSet<u32>, seqnum: u32) -> bool {
@@ -1542,14 +1539,12 @@ pub async fn server_with_occupancy_listener(
 #[cfg(test)]
 mod tests {
     use super::{
-        BULK_OUT_IDLE_FLUSH_DELAY, BufferedBulkOutState, BulkInState, BulkOutHealth,
-        EndpointAttributes, PendingBulkIn, PendingBulkOut, UsbDevice,
-        extract_configuration_descriptors, prepare_device_for_import,
+        BufferedBulkOutState, BulkInState, BulkOutHealth, EndpointAttributes, PendingBulkIn,
+        PendingBulkOut, UsbDevice, extract_configuration_descriptors, prepare_device_for_import,
         requires_bulk_out_control_barrier, should_submit_bulk_in_after_barrier,
         should_write_bulk_in_response, should_write_bulk_out_response, uses_bulk_out_worker,
     };
     use std::collections::HashSet;
-    use std::time::Duration;
 
     #[test]
     fn pending_bulk_in_completes_in_submission_order() {
@@ -1623,11 +1618,6 @@ mod tests {
         assert!(requires_bulk_out_control_barrier(0x80));
         assert!(!requires_bulk_out_control_barrier(0x02));
         assert!(!requires_bulk_out_control_barrier(0x82));
-    }
-
-    #[test]
-    fn serial_bulk_out_idle_flush_waits_past_usbip_round_trip() {
-        assert!(BULK_OUT_IDLE_FLUSH_DELAY >= Duration::from_millis(50));
     }
 
     #[test]
