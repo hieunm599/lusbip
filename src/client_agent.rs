@@ -8,8 +8,8 @@ use std::thread;
 use std::time::Duration;
 
 use crate::client::{
-    attach_remote_device, detach_port, format_remote_device_state, query_attached_ports,
-    query_remote_devices, remote_device_states,
+    attach_remote_device, attached_port_belongs_to_remote, detach_port, format_remote_device_state,
+    query_attached_ports, query_remote_devices, remote_device_states,
 };
 use crate::process::StdCommandRunner;
 use crate::tui::{TuiItem, run_action_list};
@@ -301,8 +301,20 @@ fn snapshot_from_agent(endpoint: &ClientEndpoint) -> Result<Vec<TuiItem>, String
 
 fn snapshot(endpoint: &ClientEndpoint) -> Result<Vec<TuiItem>, String> {
     let runner = StdCommandRunner;
-    let devices = query_remote_devices(&runner, endpoint.remote(), endpoint.tcp_port())?;
     let ports = query_attached_ports(&runner)?;
+    let devices = match query_remote_devices(&runner, endpoint.remote(), endpoint.tcp_port()) {
+        Ok(devices) => devices,
+        Err(err) => {
+            if ports
+                .iter()
+                .any(|port| attached_port_belongs_to_remote(endpoint.remote(), port))
+            {
+                Vec::new()
+            } else {
+                return Err(err);
+            }
+        }
+    };
     Ok(remote_device_states(endpoint.remote(), &devices, &ports)
         .iter()
         .map(|state| TuiItem {
@@ -324,12 +336,34 @@ fn toggle(
     bus_id: &str,
 ) -> ControlResponse {
     let runner = StdCommandRunner;
-    let devices = match query_remote_devices(&runner, endpoint.remote(), endpoint.tcp_port()) {
-        Ok(devices) => devices,
-        Err(err) => return ControlResponse::Error(err),
-    };
     let ports = match query_attached_ports(&runner) {
         Ok(ports) => ports,
+        Err(err) => return ControlResponse::Error(err),
+    };
+
+    let matching_port = ports.iter().find(|port| {
+        port.remote_host.as_deref() == Some(endpoint.remote())
+            && port.remote_bus_id.as_deref() == Some(bus_id)
+    });
+
+    if let Some(port) = matching_port {
+        let port_num = &port.port;
+        if !managed_ports.contains(port_num) {
+            return ControlResponse::Error(format!(
+                "USB/IP port {port_num} is not managed by this background session"
+            ));
+        }
+        return match detach_port(&runner, port_num) {
+            Ok(()) => {
+                managed_ports.remove(port_num);
+                ControlResponse::Message(format!("Detached USB/IP port {port_num}"))
+            }
+            Err(err) => ControlResponse::Error(err),
+        };
+    }
+
+    let devices = match query_remote_devices(&runner, endpoint.remote(), endpoint.tcp_port()) {
+        Ok(devices) => devices,
         Err(err) => return ControlResponse::Error(err),
     };
     let states = remote_device_states(endpoint.remote(), &devices, &ports);

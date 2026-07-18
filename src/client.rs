@@ -130,6 +130,16 @@ pub fn run_remote_control_tui(remote: &str, tcp_port: u16) -> Result<(), String>
         },
         move |item| {
             let runner = StdCommandRunner;
+            if let Some(port) = item
+                .label
+                .strip_prefix("[x] port ")
+                .and_then(|s| s.split_whitespace().next())
+            {
+                detach_port(&runner, port)
+                    .map_err(|err| friendly_client_error(&err, &action_remote, tcp_port))?;
+                return Ok(format!("Detached USB/IP port {port}"));
+            }
+
             let mut cache = action_cache
                 .lock()
                 .map_err(|_| "Remote USB device cache lock poisoned".to_string())?;
@@ -687,7 +697,7 @@ fn load_remote_device_states(
     Ok(states)
 }
 
-fn load_remote_device_states_cached(
+pub fn load_remote_device_states_cached(
     runner: &impl CommandRunner,
     remote: &str,
     tcp_port: u16,
@@ -701,7 +711,17 @@ fn load_remote_device_states_cached(
             .iter()
             .any(|state| state.attached_port.is_some())
     {
-        *cached_devices = query_remote_devices(runner, remote, tcp_port)?;
+        match query_remote_devices(runner, remote, tcp_port) {
+            Ok(devices) => *cached_devices = devices,
+            Err(err) => {
+                if !ports
+                    .iter()
+                    .any(|port| attached_port_belongs_to_remote(remote, port))
+                {
+                    return Err(err);
+                }
+            }
+        }
     }
 
     let occupancy = query_remote_occupancy(remote, tcp_port).unwrap_or_default();
@@ -938,7 +958,7 @@ fn port_matches_remote_device(
     host_bus_matches || host_vid_pid_matches || unknown_host_vid_pid_matches
 }
 
-fn attached_port_belongs_to_remote(remote: &str, port: &AttachedUsbPort) -> bool {
+pub fn attached_port_belongs_to_remote(remote: &str, port: &AttachedUsbPort) -> bool {
     port.remote_host.as_deref() == Some(remote)
         || (port.remote_host.is_none() && port.vid_pid.is_some())
 }

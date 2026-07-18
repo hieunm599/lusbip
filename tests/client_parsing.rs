@@ -1,8 +1,9 @@
 use lusbip::client::{
     AttachTarget, AttachedUsbPort, RemoteUsbDevice, extract_occupied_by,
-    format_remote_device_state, friendly_client_error, parse_remote_occupancy_status,
-    parse_usbip_list_output, parse_usbip_port_output, parse_vhci_status_ports, ports_to_detach,
-    ports_to_detach_for_missing_remote_devices, remote_device_states,
+    format_remote_device_state, friendly_client_error, load_remote_device_states_cached,
+    parse_remote_occupancy_status, parse_usbip_list_output, parse_usbip_port_output,
+    parse_vhci_status_ports, ports_to_detach, ports_to_detach_for_missing_remote_devices,
+    remote_device_states,
 };
 
 #[test]
@@ -417,4 +418,104 @@ ss  0009 004 000 00000000 000000 0-0
 "#;
 
     assert_eq!(parse_vhci_status_ports(status), vec!["00", "08"]);
+}
+
+struct MockCommandRunner {
+    usbip_port_output: std::io::Result<std::process::Output>,
+    usbip_list_output: std::io::Result<std::process::Output>,
+}
+
+impl lusbip::process::CommandRunner for MockCommandRunner {
+    fn run(&self, program: &str, args: &[&str]) -> std::io::Result<std::process::Output> {
+        if program == "usbip" && args.get(0) == Some(&"port") {
+            return match &self.usbip_port_output {
+                Ok(out) => Ok(out.clone()),
+                Err(err) => Err(std::io::Error::new(err.kind(), err.to_string())),
+            };
+        }
+        if program == "usbip" && args.contains(&"list") && args.contains(&"-r") {
+            return match &self.usbip_list_output {
+                Ok(out) => Ok(out.clone()),
+                Err(err) => Err(std::io::Error::new(err.kind(), err.to_string())),
+            };
+        }
+        panic!(
+            "MockCommandRunner called with unexpected program/args: {} {:?}",
+            program, args
+        );
+    }
+    fn run_interactive(
+        &self,
+        _program: &str,
+        _args: &[&str],
+    ) -> std::io::Result<std::process::ExitStatus> {
+        unimplemented!()
+    }
+    fn run_foreground(
+        &self,
+        _program: &str,
+        _args: &[&str],
+    ) -> std::io::Result<std::process::ExitStatus> {
+        unimplemented!()
+    }
+}
+
+fn make_mock_output(stdout: &str, success: bool) -> std::process::Output {
+    use std::os::unix::process::ExitStatusExt;
+    std::process::Output {
+        status: std::process::ExitStatus::from_raw(if success { 0 } else { 1 }),
+        stdout: stdout.as_bytes().to_vec(),
+        stderr: Vec::new(),
+    }
+}
+
+#[test]
+fn load_remote_device_states_cached_resilient_to_query_failure_when_ports_attached() {
+    let port_stdout = r#"
+Imported USB devices
+====================
+Port 00: <Port in Use> at High Speed(480Mbps)
+       Silicon Labs : CP2102 (10c4:ea60)
+       3-1 -> usbip://10.10.61.72:3240/1-1
+"#;
+
+    let runner = MockCommandRunner {
+        usbip_port_output: Ok(make_mock_output(port_stdout, true)),
+        usbip_list_output: Err(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "offline",
+        )),
+    };
+
+    let mut cache = Vec::new();
+    let result = load_remote_device_states_cached(&runner, "10.10.61.72", 3240, &mut cache);
+    assert!(
+        result.is_ok(),
+        "Expected success due to resilience when ports are attached, got {:?}",
+        result
+    );
+    let states = result.unwrap();
+    assert_eq!(states.len(), 1);
+    assert_eq!(states[0].attached_port.as_deref(), Some("00"));
+}
+
+#[test]
+fn load_remote_device_states_cached_fails_when_query_fails_and_no_ports_attached() {
+    let runner = MockCommandRunner {
+        usbip_port_output: Ok(make_mock_output(
+            "Imported USB devices\n====================\n",
+            true,
+        )),
+        usbip_list_output: Err(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "offline",
+        )),
+    };
+
+    let mut cache = Vec::new();
+    let result = load_remote_device_states_cached(&runner, "10.10.61.72", 3240, &mut cache);
+    assert!(
+        result.is_err(),
+        "Expected error because no ports are attached"
+    );
 }
